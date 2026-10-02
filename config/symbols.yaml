@@ -1,0 +1,18 @@
+symbols:
+  ETHUSDT:
+    enabled: true
+    base_interval: 15m
+    intervals: [15m, 1h, 4h]
+    since: "2024-01-01"
+    contract: usdm_perp
+    leverage_default: 3
+    strategies: [rule_v1]
+  # 新增品种照此复制即可（BTCUSDT/SOLUSDT ...）
+  BTCUSDT:
+    enabled: false
+    base_interval: 15m
+    intervals: [15m, 1h, 4h]
+    since: "2024-01-01"
+    contract: usdm_perp
+    leverage_default: 3
+    strategies: [rule_v1]

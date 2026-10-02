@@ -1,0 +1,22 @@
+network:
+  proxy_url: "http://127.0.0.1:7897"   # Clash Verge 混合端口；env QUANT_PROXY_URL 优先
+  rest_base_usdm: "https://fapi.binance.com"
+  ws_base_usdm: "wss://fstream.binance.com"
+  timeout_sec: 20
+  weight_budget_per_min: 1700           # 交易所约 2400/min，留余量
+  max_retries: 5
+  resync_grace_ms: 2000                 # REST 覆盖 WS 尾bar 的等待窗口
+
+paths:
+  data_dir: "data"
+  reports_dir: "reports"
+
+logging:
+  level: "INFO"
+  console: true
+  file: "logs/quant.log"
+
+backtest:
+  default_start: "2024-01-01"
+  intra_bar_path: bar_hl                # bar_hl | exact_1m（1m 数据回填后切换）
+  sl_first_on_conflict: true            # 同一根 bar 同时触及 SL/TP 时保守取 SL

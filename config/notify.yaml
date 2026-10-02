@@ -1,0 +1,9 @@
+channels: [stdout, feishu]
+
+feishu:
+  enabled: true
+  webhook_url_env: FEISHU_WEBHOOK_URL
+  secret_env: FEISHU_SECRET
+  max_per_min: 40
+  min_interval_sec: 0.25
+  dedup_ttl_min: 30

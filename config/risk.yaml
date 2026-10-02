@@ -1,0 +1,48 @@
+account:
+  initial_equity_usdt: 10000
+
+sizing:
+  method: fixed_risk          # fixed_risk | fixed_fraction | vol_target
+  risk_pct: 0.01              # 单笔最大亏损占权益比
+  vol_target_annual: 0.30     # method=vol_target 时使用
+  strength_scaling: true      # 用 signal.strength 在 [0.5,1] 内缩放
+  strength_floor: 0.5
+
+caps:
+  max_notional_usdt: 5000
+  global_max_leverage: 3.0
+  max_margin_per_symbol_pct: 0.30
+  max_new_entries_per_day: 4
+
+stops:
+  atr_interval: 15m           # ATR 用 base_interval，保证与信号同尺度
+  atr_period: 14
+  sl_atr_mult: 1.5
+  tp_atr_mult: 3.0
+  tp1_r: 1.0
+  tp1_close_frac: 0.5
+  breakeven_after_r: 1.0
+  trail_atr_mult: 3.0
+  time_stop_bars: 96          # 以 base_interval 计数，96 * 15m = 24h
+  allow_short: true
+
+margin:
+  # 仅作 exchangeInfo 不可用时的兜底；正常回填会用交易所真实字段覆盖
+  # 实测 ETHUSDT：maintMarginPercent=2.5 → 0.025，requiredMarginPercent=5 → 上限 20x
+  maint_margin_rate: 0.025
+  max_leverage_default: 20.0   # 交易所侧最大杠杆，平台侧仍受 caps.global_max_leverage 约束
+  liquidation_fee_rate: 0.0125
+  isolated: true
+
+guard:
+  daily_loss_stop_pct: 0.03
+  max_drawdown_pause_pct: 0.15
+  max_consecutive_losses: 5
+  cooldown_hours: 24
+  stale_data_max_gap_min: 5
+
+costs:
+  taker_fee_rate: 0.0005
+  maker_fee_rate: 0.0002
+  slippage_bps: 2.0
+  include_funding: true

@@ -1,0 +1,25 @@
+name: rule_v1
+base_interval: 15m
+htf: [1h, 4h]
+label: "多周期趋势跟随：4h 趋势过滤 + 1h StochRSI 确认 + 15m 触发"
+
+params:
+  trend_4h:
+    ema_fast: 20
+    ema_slow: 60
+    macd: { fast: 12, slow: 26, signal: 9 }
+  confirm_1h:
+    rsi_len: 14
+    stoch_len: 14
+    k: 3
+    d: 3
+    oversold: 20
+    overbought: 80
+  trigger_15m:
+    ema: 20
+    atr_len: 14
+    macd: { fast: 12, slow: 26, signal: 9 }
+    atr_rank_len: 20
+    atr_rank_min: 0.5
+  exit:
+    trend_flip_bars: 2
