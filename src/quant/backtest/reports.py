@@ -22,6 +22,33 @@ MAX_TIP_EVENTS = 10
 # K 线聚合源候选周期，从细到粗
 _FINER_FIRST = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d")
 
+# 平仓原因的标签与颜色：kline tooltip、图例、逐笔流水三处共用一份，
+# 各自维护副本会漏项（曾漏 signal，报表上直接显示英文 "signal"）
+REASON_CN: dict[str, str] = {
+    "signal": "信号平仓",
+    "sl": "止损",
+    "tp": "止盈",
+    "tp1": "止盈 1",
+    "tp2": "止盈 2",
+    "trail": "移动止损",
+    "time": "时间止损",
+    "liq": "强平",
+    "flip": "反手",
+    "flat": "期末平仓",
+}
+REASON_COLOR: dict[str, str] = {
+    "signal": "#3498db",
+    "sl": "#e74c3c",
+    "tp": "#27ae60",
+    "tp1": "#2ecc71",
+    "tp2": "#1abc9c",
+    "trail": "#9b59b6",
+    "time": "#f39c12",
+    "liq": "#c0392b",
+    "flip": "#e67e22",
+    "flat": "#7f8c8d",
+}
+
 _LOG = logging.getLogger(__name__)
 
 
@@ -204,8 +231,6 @@ def _render_kline_file(
     entry_marks: list[dict] = []
     exit_marks: list[dict] = []
     trades_by_idx: dict[int, list[str]] = {}
-    _EXIT_COLOR = {"sl": "#e74c3c", "tp": "#27ae60", "time": "#f39c12", "flat": "#7f8c8d"}
-    _REASON_CN = {"sl": "止损", "tp": "止盈", "time": "时间止损", "flat": "期末平仓"}
     for i, t in enumerate(trades):
         is_long = t.side == "long"
         # tooltip 可视高度有限：每笔压到 1~2 行，日期用 bar 头给出，这里只留时分。
@@ -232,12 +257,12 @@ def _render_kline_file(
                 },
             })
             trades_by_idx.setdefault(e_idx, []).append(entry_html)
-        exit_color = _EXIT_COLOR.get(t.reason, "#7f8c8d")
+        exit_color = REASON_COLOR.get(t.reason, "#7f8c8d")
         ret_color = "#27ae60" if t.pnl > 0 else "#e74c3c"
         # 两行为限：保证金/持仓根数在「逐笔交易流水」表里，tooltip 里不重复占高。
         exit_html = (
             f"<b style='color:{exit_color}'>●平仓 #{i+1} "
-            f"{_REASON_CN.get(t.reason, t.reason.upper())}</b>"
+            f"{REASON_CN.get(t.reason, t.reason.upper())}</b>"
             f"<span style='color:#8b92a8'> {bj_str(t.exit_time, '%H:%M')} </span>"
             f"价 <b>{t.exit_price:.4f}</b><br>"
             f"<span style='color:{ret_color};font-weight:600'>PnL {t.pnl:+.4f}U"
@@ -402,6 +427,31 @@ def _render_kline_file(
     kline_chart.render(str(out_path))
 
 
+def _monthly_returns(
+    timestamps: list[datetime],
+    equity,
+    initial_equity: float,
+) -> pd.Series:
+    """按北京时间月末分桶的月度收益率；首月用窗口起点权益做基准。
+
+    分桶必须按北京时间切：UTC 月界对应北京每月 1 日 08:00，直接 resample 会把
+    每月头 8 小时的盈亏算进上个月。
+    pct_change() 会让第一个月变成 NaN 被 drop，等于系统性隐藏首月盈亏
+    （实测 lgbm_v1 半年报里 2026-04 的 23 笔 / −8.28 USDT 整月消失）。
+    """
+    ts = pd.DatetimeIndex(pd.to_datetime(timestamps))
+    if ts.tz is None:
+        ts = ts.tz_localize(UTC)
+    ts = ts.tz_convert(BJ_TZ).tz_localize(None)
+    monthly = pd.Series(np.asarray(equity, dtype=float), index=ts).resample("ME").last().dropna()
+    if monthly.empty:
+        return monthly
+    base = float(initial_equity) if initial_equity > 0 else float(monthly.iloc[0])
+    ret = monthly.pct_change()
+    ret.iloc[0] = monthly.iloc[0] / base - 1.0
+    return ret.dropna()
+
+
 def write_html_full_report(
     path: Path,
     result,
@@ -451,15 +501,7 @@ def write_html_full_report(
     avg_margin = float(np.mean([t.margin_usdt for t in closed])) if closed else 0.0
 
     # 月度收益
-    # 分桶必须按北京时间切：UTC 月界对应北京每月 1 日 08:00，
-    # 直接 resample 会把每月头 8 小时的盈亏算进上个月。
-    ts_dt = pd.DatetimeIndex(pd.to_datetime(timestamps))
-    if ts_dt.tz is None:
-        ts_dt = ts_dt.tz_localize(UTC)
-    ts_dt = ts_dt.tz_convert(BJ_TZ).tz_localize(None)
-    eq_df = pd.DataFrame({"equity": eq}, index=ts_dt)
-    monthly = eq_df.resample("ME")["equity"].last()
-    monthly_ret = monthly.pct_change().dropna()
+    monthly_ret = _monthly_returns(timestamps, eq, initial_equity)
 
     # 按平仓原因分组
     reason_stats: dict[str, dict] = {}
@@ -471,9 +513,6 @@ def write_html_full_report(
         reason_stats[key]["pnl_sum"] += t.pnl
         if t.pnl > 0:
             reason_stats[key]["wins"] += 1
-
-    # 平仓原因颜色映射
-    _REASON_COLOR = {"sl": "#e74c3c", "tp": "#27ae60", "time": "#f39c12", "flat": "#95a5a6"}
 
     # ---- Plotly 图表 ----
     fig = make_subplots(
@@ -604,6 +643,13 @@ def write_html_full_report(
                     f'data-src="{fn}">{_label_cn.get(lb, lb)}</button>'
                     for lb, fn in built
                 )
+                # 出场图例按本次真实出现的平仓原因生成：写死三项会漏掉 signal/trail
+                exit_legend = "".join(
+                    f'<div class="legend-item"><span style="display:inline-block;width:9px;height:9px;'
+                    f'background:{REASON_COLOR.get(r, "#7f8c8d")};border-radius:50%"></span> '
+                    f'{REASON_CN.get(r, r.upper())}</div>'
+                    for r in reason_stats
+                )
                 candle_html = (
                     '<h2>K 线蜡烛图 · 买卖点标注（pyecharts）</h2>'
                     '<div class="chart-wrap">'
@@ -613,9 +659,7 @@ def write_html_full_report(
                     '<div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>阴线（收盘&lt;开盘）</div>'
                     '<div class="legend-item"><span style="color:#27ae60">▲</span> 开多 B</div>'
                     '<div class="legend-item"><span style="color:#e74c3c">▼</span> 开空 S</div>'
-                    '<div class="legend-item"><span style="display:inline-block;width:9px;height:9px;background:#e74c3c;border-radius:50%"></span> 止损</div>'
-                    '<div class="legend-item"><span style="display:inline-block;width:9px;height:9px;background:#27ae60;border-radius:50%"></span> 止盈</div>'
-                    '<div class="legend-item"><span style="display:inline-block;width:9px;height:9px;background:#f39c12;border-radius:50%"></span> 时间止损</div>'
+                    + exit_legend +
                     f'<div class="legend-item">⇆ <span style="color:#8b92a8">切换周期 / 底部滑块缩放 / 悬停 bar 看交易详情'
                     f'（同根 bar 事件多于 {MAX_TIP_EVENTS} 笔时折叠，完整明细见下方「逐笔交易流水」）</span></div>'
                     '</div>'
@@ -640,8 +684,8 @@ def write_html_full_report(
         return f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;background:{color};color:white;font-size:0.72rem;font-weight:700;">{label}</span>'
 
     def reason_html(r: str) -> str:
-        color = _REASON_COLOR.get(r, "#7f8c8d")
-        label = {"sl": "止损", "tp": "止盈", "time": "时间止损", "flat": "期末平仓"}.get(r, r)
+        color = REASON_COLOR.get(r, "#7f8c8d")
+        label = REASON_CN.get(r, r.upper())
         return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;background:{color};color:white;font-size:0.72rem;font-weight:600;">{label}</span>'
 
     trade_rows = ""

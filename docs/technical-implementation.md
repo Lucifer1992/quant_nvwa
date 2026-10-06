@@ -4,7 +4,7 @@
 > 设计决策的论证过程见 `docs/` 下其余设计文档；与本文冲突时，以本文为准（本文对齐 2026-10-07 的代码）。
 
 - 代码基线：`master`，`git ls-files` 之上另有 40 个未提交文件（用户要求：本轮不提交 git）
-- 校验状态：`uv run pytest -q` → **133 passed**；`uv run ruff check --select F,E9 src tests` → clean
+- 校验状态：`uv run pytest -q` → **147 passed**；`uv run ruff check --select F,E9 src tests` → clean
 - 数据基线：`data/quant.db`，ETHUSDT 5m/15m/1h/4h/1d + funding，2024-01-01 起
 - 可比性声明：**本文第 13 节列出的修复之前的所有回测数字都不可与现在的数字比较**（口径变了，不是策略变差了）
 
@@ -51,7 +51,7 @@ cli.py       typer 应用：backfill / check-data / exchange-info / test-card / 
 
 ### 1.3 实现状态
 
-**已实现并实测**：REST 数据层与断点续传、SQLite 落库与质量闸门、5m/1h/4h 多周期事件驱动回测、固定风险定仓、金字塔加仓、移动止损、资金费计提、飞书卡片、4 个规则策略 + LightGBM walk-forward 训练与推理、HTML 多周期 K 线报告、133 项离线单测。
+**已实现并实测**：REST 数据层与断点续传、SQLite 落库与质量闸门、5m/1h/4h 多周期事件驱动回测、固定风险定仓、金字塔加仓、移动止损、资金费计提、飞书卡片、4 个规则策略 + LightGBM walk-forward 训练与推理、HTML 多周期 K 线报告、147 项离线单测。
 
 **未实现（明确不做或延后）**：WebSocket/1m 数据、模拟交易服务与 shell 启动脚本（§15）、TP1 分批止盈与保本移动、`caps`/`guard` 中的 `[paper]` 风控闸门、强平价触发平仓、多品种并行回测（BTCUSDT 未回填）。
 
@@ -444,7 +444,7 @@ valid = (ts >= f.valid_start) & (ts < f.valid_end - embargo)
 
 关键实现约定：
 
-- **北京时间（UTC+8）** 贯穿所有展示与月度分桶；日线桶起点即北京 08:00（=UTC 00:00）
+- **北京时间（UTC+8）** 贯穿所有展示与月度分桶；日线桶起点即北京 08:00（=UTC 00:00）；月度分桶首月用窗口起点权益做基准（否则首月盈亏整月消失，见 §13.1 第 34 条）
 - K 线源周期按 `_FINER_FIRST = ("1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d")` **从细到粗**取第一个可用序列（源只能向粗降采样，判定写反会让 5m 源分支变死代码）；当前 `base_interval=5m`，故 15m/1h/4h/1d 全部由 5m 聚合（`_agg_bars` 用 pandas `resample`），文件名与标题标注"聚合自 5m"
 - 目标周期列表会过滤掉比源周期更细的项（`interval_ms(target) >= src_ms`）
 - 单个周期渲染失败只 `_LOG.warning` 并跳过，不让整个 K 线区块凭空消失
@@ -487,7 +487,7 @@ uv run quant backtest --symbol ETHUSDT --strategy rule_v4 --start 2026-04-01 --e
 
 ---
 
-## 12. 测试体系（`uv run pytest -q` → 133 passed，全部离线）
+## 12. 测试体系（`uv run pytest -q` → 147 passed，全部离线）
 
 | 文件 | 数量 | 覆盖点 |
 |---|---|---|
@@ -500,6 +500,7 @@ uv run quant backtest --symbol ETHUSDT --strategy rule_v4 --start 2026-04-01 --e
 | `test_strategy_ml.py` | 16 | 折选择、折外告警且不产信号、`feature_spec_hash` drift guard、冷却、`size_mult` 钳位、`bind_history` 缺失时安全返回 None |
 | `test_strategy_rule_v4.py` | 31 | 状态机转移、4h 仓位倍数、A/B 两个入场口、BROKEN 平仓信号 |
 | `test_train_walkforward.py` | 8 | `plan_folds` 衔接与末折钳位、窗口不足抛错、`fold_masks` 两端 purge 边界（含 `embargo=0` 的反证）、标签编码往返、`edge_from_proba` |
+| `test_report_metrics.py` | 14 | 月度收益含首月、逐月复利等于总收益、月末分桶按北京时间、每个 `FillReason` 都有中文标签与颜色 |
 
 测试全部用 `httpx.MockTransport` 与内存 SQLite，不触网、不依赖 `data/quant.db`。
 
@@ -549,6 +550,8 @@ uv run quant backtest --symbol ETHUSDT --strategy rule_v4 --start 2026-04-01 --e
 31. 数据闸门：`backtest` 默认在缺柱时中止（`--allow-gaps` 可放行），`check-data` 输出覆盖率/缺口/一致性/指纹
 32. `_boot` 把 `validate_config` 当错误处理（退出码 2）；`backfill --intervals` 帮助文本示例改为与现行周期一致（`5m,1h`）
 33. 飞书通路：webhook 直连不挂代理（走 Clash 反被路由到境外节点）；限流 `FeishuBusy` 退避；`sample_signal_decision` 与 10× 政策对齐（`margin=notional/10`、1h 决策周期、真实 tick/step 量级的 qty 与价位）
+34. 月度收益永久漏掉首月：`resample("ME").pct_change().dropna()` 让第一个月恒为 NaN 被丢弃，报表看不到首月盈亏（lgbm_v1 半年报里 2026-04 的 23 笔 / −8.28% 整月消失）。现用窗口起点权益作首月基准，逐月复利回到总收益
+35. 平仓原因的中文/颜色在 kline tooltip、图例、逐笔流水三处各写一份且都漏 `signal`：流水表显示英文 "signal"、图例只有写死的三项。改为 `REASON_CN`/`REASON_COLOR` 一份共享，图例按本次真实出现的原因生成
 
 ### 13.2 回归证据：账本恒等式
 
