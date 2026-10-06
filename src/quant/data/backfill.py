@@ -107,7 +107,13 @@ class Backfiller:
             if len(rows) < KLINE_PAGE:
                 break
 
-        report.gaps = self.store.find_gaps(symbol, interval, step)
+        # find_gaps 是全库口径，expected_bars 是本次请求范围口径；两者混用会让
+        # coverage 被范围外的历史缺口吃成负数。裁到本次范围内再统计。
+        report.gaps = [
+            (max(gs, report.start_ms), min(ge, report.end_ms))
+            for gs, ge in self.store.find_gaps(symbol, interval, step)
+            if ge > report.start_ms and gs < report.end_ms
+        ]
         report.missing_bars = sum((e - s) // step for s, e in report.gaps)
         return report
 

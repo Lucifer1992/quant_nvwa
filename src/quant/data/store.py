@@ -11,7 +11,7 @@ from typing import Self
 import pandas as pd
 
 from ..core.contracts import Bar, FundingBar
-from ..core.timeframe import source_rank
+from ..core.timeframe import source_rank, to_ms
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars (
@@ -97,7 +97,7 @@ class Store:
     def upsert_bars(self, bars: Iterable[Bar]) -> int:
         rows = [
             (
-                b.symbol, b.interval, int(b.ts_open.timestamp() * 1000), int(b.ts_close.timestamp() * 1000),
+                b.symbol, b.interval, to_ms(b.ts_open), to_ms(b.ts_close),
                 b.open, b.high, b.low, b.close, b.volume, b.quote_volume, b.taker_buy_volume,
                 int(b.trades), int(bool(b.is_closed)), b.src, source_rank(b.is_closed, b.src),
             )
@@ -105,14 +105,16 @@ class Store:
         ]
         if not rows:
             return 0
+        before = self._conn.total_changes
         with self._conn:
             self._conn.executemany(_UPSERT_BARS, rows)
-        return len(rows)
+        # prio 守卫会拒掉低优先级的重复行，len(rows) 是"尝试写入数"而非真实落库数
+        return int(self._conn.total_changes - before)
 
     def upsert_funding(self, rows: Sequence[FundingBar]) -> int:
         data = [
             (
-                f.symbol, int(f.funding_time.timestamp() * 1000), f.funding_rate, f.mark_price,
+                f.symbol, to_ms(f.funding_time), f.funding_rate, f.mark_price,
                 f.rate_type, f.interval_hours, f.src,
             )
             for f in rows

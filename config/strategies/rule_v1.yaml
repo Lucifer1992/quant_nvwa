@@ -1,7 +1,10 @@
+# 策略声明文件。运行时参数来自策略的 config_cls 默认值 + CLI 选项，本文件不会被
+# 回测加载；它的作用是 validate_config 的交叉校验输入（base_interval / htf 必须与
+# symbols.yaml 的 intervals 一致）以及记录指标口径。
 name: rule_v1
-base_interval: 15m
+base_interval: 5m
 htf: [1h, 4h]
-label: "多周期趋势跟随：4h 趋势过滤 + 1h StochRSI 确认 + 15m 触发"
+label: "多周期趋势跟随：4h 趋势过滤 + 1h StochRSI 确认 + 5m 触发"
 
 params:
   trend_4h:
@@ -15,7 +18,7 @@ params:
     d: 3
     oversold: 20
     overbought: 80
-  trigger_15m:
+  trigger_5m:
     ema: 20
     atr_len: 14
     macd: { fast: 12, slow: 26, signal: 9 }

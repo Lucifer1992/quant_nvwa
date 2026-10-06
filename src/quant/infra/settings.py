@@ -83,6 +83,10 @@ class Settings:
         return self.data_dir / self._get("paths", "db_name", "quant.db")
 
     @property
+    def models_dir(self) -> Path:
+        return self.root / self._get("paths", "models_dir", "models")
+
+    @property
     def backtest_default_start(self) -> str:
         return str(self.backtest.get("default_start", "2024-01-01"))
 
@@ -171,8 +175,6 @@ def validate_config(s: Settings) -> list[str]:
 
     if sizing.get("method") == "fixed_risk" and not sizing.get("risk_pct"):
         problems.append("sizing.method=fixed_risk 需要 sizing.risk_pct")
-    if sizing.get("strength_scaling") and float(sizing.get("strength_floor", 1.0)) > 1.0:
-        problems.append("sizing.strength_floor > 1 会把仓位放大而非缩小")
     tp_mult, sl_mult = stops.get("tp_atr_mult"), stops.get("sl_atr_mult")
     if tp_mult and sl_mult and tp_mult <= sl_mult:
         problems.append(f"stops.tp_atr_mult={tp_mult} <= sl_atr_mult={sl_mult}，盈亏比为负，策略不可能正期望")

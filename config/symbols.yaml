@@ -1,18 +1,20 @@
 symbols:
   ETHUSDT:
     enabled: true
-    base_interval: 15m
-    intervals: [15m, 1h, 4h]
+    # base_interval 决定 backfill/check-data 实际回填与校验的最低周期，
+    # 也是回测引擎的结算节奏（当前所有策略都在 5m 触发、1h 决策）。
+    base_interval: 5m
+    intervals: [5m, 1h, 4h]
     since: "2024-01-01"
     contract: usdm_perp
-    leverage_default: 3
+    leverage_default: 10
     strategies: [rule_v1]
   # 新增品种照此复制即可（BTCUSDT/SOLUSDT ...）
   BTCUSDT:
     enabled: false
-    base_interval: 15m
-    intervals: [15m, 1h, 4h]
+    base_interval: 5m
+    intervals: [5m, 1h, 4h]
     since: "2024-01-01"
     contract: usdm_perp
-    leverage_default: 3
+    leverage_default: 10
     strategies: [rule_v1]

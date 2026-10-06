@@ -1,18 +1,39 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from ..core.contracts import Action, RiskDecision, Signal
 
-_TEMPLATE_BY_ACTION = {
+BJ_TZ = timezone(timedelta(hours=8))  # 北京时间 UTC+8
+
+# 金字塔加仓是独立动作，漏了会在卡片标题/方向处 KeyError 或显示原始枚举名
+_TEMPLATE_BY_ACTION: dict[Action, tuple[str, str]] = {
     Action.OPEN_LONG: ("green", "做多信号"),
     Action.OPEN_SHORT: ("red", "做空信号"),
+    Action.ADD_TO_LONG: ("light_green", "加仓做多"),
+    Action.ADD_TO_SHORT: ("light_red", "加仓做空"),
     Action.CLOSE_LONG: ("blue", "平多"),
     Action.CLOSE_SHORT: ("blue", "平空"),
 }
 
-_ICON = {Action.OPEN_LONG: "🟢", Action.OPEN_SHORT: "🔴", Action.CLOSE_LONG: "🔵", Action.CLOSE_SHORT: "🔵"}
+_ICON = {
+    Action.OPEN_LONG: "🟢",
+    Action.OPEN_SHORT: "🔴",
+    Action.ADD_TO_LONG: "➕🟢",
+    Action.ADD_TO_SHORT: "➕🔴",
+    Action.CLOSE_LONG: "🔵",
+    Action.CLOSE_SHORT: "🔵",
+}
+
+_DIRECTION = {
+    Action.OPEN_LONG: "做多",
+    Action.OPEN_SHORT: "做空",
+    Action.ADD_TO_LONG: "加多",
+    Action.ADD_TO_SHORT: "加空",
+    Action.CLOSE_LONG: "平多",
+    Action.CLOSE_SHORT: "平空",
+}
 
 
 def _px(v: float | None) -> str:
@@ -26,7 +47,7 @@ def _title(sig: Signal, dec: RiskDecision) -> str:
 
 
 def _overview(sig: Signal, dec: RiskDecision) -> str:
-    direction = {"open_long": "Long", "open_short": "Short", "close_long": "Close Long", "close_short": "Close Short"}[sig.action.value]
+    direction = _DIRECTION.get(sig.action, str(sig.action))
     return (
         f"**方向** {direction} ｜ **杠杆** {dec.leverage:g}x ｜ **信号强度** {sig.strength:.2f}\n"
         f"**参考价** {_px(sig.price_ref)}（{sig.timeframe} 收盘价）｜ **模式** {sig.mode.value}"
@@ -72,7 +93,7 @@ def build_elements(sig: Signal, dec: RiskDecision) -> list[dict[str, Any]]:
     elements.append({"tag": "hr"})
     elements.append(md(f"**理由** {sig.reason}"))
     note = (
-        f"bar close {sig.ts_signal.astimezone(UTC).strftime('%Y-%m-%d %H:%M')} UTC ｜ "
+        f"bar close {sig.ts_signal.astimezone(BJ_TZ):%Y-%m-%d %H:%M}（北京时间） ｜ "
         "模拟交易信号，非投资建议"
     )
     elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": note}]})
@@ -93,30 +114,31 @@ def build_card(sig: Signal, dec: RiskDecision) -> dict[str, Any]:
 
 
 def sample_signal_decision(*, approved: bool = True) -> tuple[Signal, RiskDecision]:
-    """用于通知链路的冒烟测试与卡片排版检查。"""
+    """用于通知链路的冒烟测试与卡片排版检查，数值与固定 10× 杠杆的风控口径一致。"""
+    price, atr, qty = 2615.42, 32.0, 0.05
     sig = Signal(
-        signal_id="test-ethusdt-15m-long",
+        signal_id="test-ethusdt-1h-long",
         ts_signal=datetime.now(UTC).replace(second=0, microsecond=0),
         symbol="ETHUSDT",
-        timeframe="15m",
+        timeframe="1h",
         strategy="rule_v1",
         action=Action.OPEN_LONG,
-        price_ref=2615.42,
+        price_ref=price,
         strength=0.72,
-        reason="4h 趋势向上(MACD>0, EMA20>EMA60)；1h StochRSI 自超卖区上穿；15m MACD 柱转正且收盘上穿 EMA20，ATR 处于近 20 根中位以上",
+        reason="4h 趋势向上(MACD>0, EMA20>EMA60)；1h StochRSI 自超卖区上穿；5m MACD 柱转正且收盘上穿 EMA20，ATR 处于近 20 根中位以上",
     )
     dec = RiskDecision(
         signal=sig,
         approved=approved,
-        qty=0.38,
-        notional_usdt=994.0,
-        leverage=3.0,
-        margin_usdt=331.0,
-        stop_loss=2576.10,
-        take_profits=(2654.74, 2694.06),
-        est_liq_price=1832.5,
-        equity_usdt=10000.0,
-        risk_usdt=100.0,
-        reject_reasons=() if approved else ("单品种保证金占比超限 30%", "名义敞口超上限"),
+        qty=qty,
+        notional_usdt=round(qty * price, 2),
+        leverage=10.0,
+        margin_usdt=round(qty * price / 10.0, 2),
+        stop_loss=round(price - 2.0 * atr, 2),
+        take_profits=(round(price + 2.0 * atr, 2), round(price + 3.5 * atr, 2)),
+        est_liq_price=round(price * (1 - 1 / 10.0 + 0.025), 2),
+        equity_usdt=100.0,
+        risk_usdt=round(qty * 2.0 * atr, 2),
+        reject_reasons=() if approved else ("净值不足以覆盖保证金",),
     )
     return sig, dec

@@ -1,40 +1,41 @@
+# 风控参数。回测链路今天只读取 caps.global_max_leverage 与 stops.*（供 validate_config
+# 交叉校验，并与 CLI 的 --lev/--sl-atr/--tp-atr 默认值保持一致）；
+# caps/guard 中标注 [paper] 的键是模拟交易服务（quant paper）的输入，回测不生效。
 account:
-  initial_equity_usdt: 10000
+  initial_equity_usdt: 100          # 实盘/模拟本金 100U；回测用 --equity 覆盖
 
 sizing:
-  method: fixed_risk          # fixed_risk | fixed_fraction | vol_target
-  risk_pct: 0.01              # 单笔最大亏损占权益比
-  vol_target_annual: 0.30     # method=vol_target 时使用
-  strength_scaling: true      # 用 signal.strength 在 [0.5,1] 内缩放
-  strength_floor: 0.5
+  method: fixed_risk                # 唯一实现：单笔风险 = equity × risk_pct
+  risk_pct: 0.01                    # 单笔最大亏损占权益比
 
 caps:
-  max_notional_usdt: 5000
-  global_max_leverage: 3.0
-  max_margin_per_symbol_pct: 0.30
-  max_new_entries_per_day: 4
+  global_max_leverage: 10.0         # 固定全程 10×，margin = notional / 该值
+  max_notional_usdt: 5000           # [paper] 回测未强制
+  max_margin_per_symbol_pct: 0.30   # [paper] 回测未强制
+  max_new_entries_per_day: 4        # [paper] 回测未强制
 
 stops:
-  atr_interval: 15m           # ATR 用 base_interval，保证与信号同尺度
+  atr_interval: 5m                  # 与 base_interval 同尺度；改动必须同步 symbols.yaml
   atr_period: 14
-  sl_atr_mult: 1.5
-  tp_atr_mult: 3.0
-  tp1_r: 1.0
-  tp1_close_frac: 0.5
-  breakeven_after_r: 1.0
-  trail_atr_mult: 3.0
-  time_stop_bars: 96          # 以 base_interval 计数，96 * 15m = 24h
+  sl_atr_mult: 1.5                  # 5m 规则策略默认；策略可用 engine_defaults() 覆盖（rule_v4/lgbm_v1 为 2.0）
+  tp_atr_mult: 3.0                  # 必须 > sl_atr_mult，validate_config 会检查
+  time_stop_bars: 288               # 以 base_interval 计数，288 × 5m = 24h
   allow_short: true
+  # 以下字段尚未实现，只记录设计意图（引擎目前是 TP 全平、无保本移动）：
+  # tp1_r: 1.0                      # 到 1R 平一半
+  # tp1_close_frac: 0.5
+  # breakeven_after_r: 1.0          # 到 1R 后止损移到开仓价
+  # trail_atr_mult: 3.0             # 实际跟随距离由 CLI/engine_defaults 的 --trail-atr-mult 决定
 
 margin:
   # 仅作 exchangeInfo 不可用时的兜底；正常回填会用交易所真实字段覆盖
   # 实测 ETHUSDT：maintMarginPercent=2.5 → 0.025，requiredMarginPercent=5 → 上限 20x
   maint_margin_rate: 0.025
-  max_leverage_default: 20.0   # 交易所侧最大杠杆，平台侧仍受 caps.global_max_leverage 约束
+  max_leverage_default: 20.0        # 交易所侧最大杠杆，平台侧仍受 caps.global_max_leverage 约束
   liquidation_fee_rate: 0.0125
   isolated: true
 
-guard:
+guard:                              # [paper] 模拟交易服务的风控闸门，回测不生效
   daily_loss_stop_pct: 0.03
   max_drawdown_pause_pct: 0.15
   max_consecutive_losses: 5
@@ -42,7 +43,6 @@ guard:
   stale_data_max_gap_min: 5
 
 costs:
-  taker_fee_rate: 0.0005
-  maker_fee_rate: 0.0002
-  slippage_bps: 2.0
+  taker_fee_rate: 0.0005            # 全 taker 成交：入场与出场都按吃单计价
+  slippage_bps: 2.0                 # 每笔成交都取不利方向
   include_funding: true

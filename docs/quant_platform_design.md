@@ -310,6 +310,11 @@ class Strategy(Protocol):
 
 规则引擎以 **声明式条件树** 表达（YAML → 条件组合 AND/OR），新增规则不改代码；`reason_text` 由条件树自动渲染，便于卡片展示。
 
+> **实现现状（2026-10-04）**：规则策略以 Python 子类落地在 `strategy/rules/`（`rule_v1`~`rule_v4`），
+> 走 `BaseStrategy` + `@register`，条件树尚未 YAML 化。其中 `rule_v4` 是第一个「决策周期（1h）≠
+> 引擎结算周期（5m）」的策略，为此给 `Signal.meta` 加了 `atr` / `size_mult` 两个通道，并新增
+> `engine_defaults()` 钩子让策略声明自己的出场参数；设计与实测结论见 `docs/rule_v4-trend-design.md`。
+
 ### 6.3 策略 B：深度学习策略
 
 ```
@@ -426,7 +431,7 @@ class Strategy(Protocol):
 
 ### 7.4 复现性
 
-`quant backtest` 生成的 `reports/{run_id}/` 内含：`run_meta.json`（config 快照 hash + dataset_version + 事件顺序种子/随机种子 + 引擎版本）、`metrics.json`、`equity.csv`、`fills.csv`、`chart.html`（plotly 静态页，浏览器打开即可，无需 web 服务）。产物一律用 CSV/JSON 而不用 Parquet，与"数据只用 SQLite 落库"的约定保持一致。同一 config + 同一 dataset_version 必须产出逐字节一致的 metrics（连跑两次校验）。
+`quant backtest` 生成的 `reports/{run_id}/` 内含：`run_meta.json`（config 快照 hash + dataset_version + 事件顺序种子/随机种子 + 引擎版本）、`metrics.json`、`equity.csv`、`trades.csv`、`fills.csv`、`report.html`（唯一查看入口：核心指标卡 + 净值/回撤/逐笔 PnL/月度收益四联图 + 15m/1h/4h/日线多周期 K 线买卖点标注，逐笔流水含保证金与保证金收益率；浏览器直接打开即可，无需 web 服务）。K 线各周期另存为同目录下的 `kline_*.html`，由 `report.html` 内嵌 iframe 切换。产物一律用 CSV/JSON 而不用 Parquet，与"数据只用 SQLite 落库"的约定保持一致。同一 config + 同一 dataset_version 必须产出逐字节一致的 metrics（连跑两次校验）。
 
 ---
 

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime
 from typing import Any, Self
 
 import httpx
 
 from ..core.contracts import Bar, FundingBar
-from ..core.timeframe import interval_ms, to_dt
+from ..core.timeframe import to_dt
 from ..infra.log import get_logger
 
 _log = get_logger("quant.data.rest")
 
-KLINE_WEIGHT = {1500: 5, 1000: 4, 500: 3, 200: 2, 100: 1}
+# /fapi/v1/klines 的权重按 limit 分档（下界含）：[1,100)=1, [100,500)=2, [500,1000)=5, [1000,+)=10
+# 原表把 1500 记成 5、1000 记成 4、且 limit=100 只算 1，系统性低估权重，
+# 容易在长历史回填时把 IP 推到 429/418（封禁可达数小时）。
+KLINE_WEIGHT_TIERS: tuple[tuple[int, int], ...] = ((1000, 10), (500, 5), (100, 2), (1, 1))
 
 
 class BinanceRestError(RuntimeError):
@@ -33,7 +35,7 @@ class AccessDenied(BinanceRestError):
 
 
 def _kline_weight(limit: int) -> int:
-    for threshold, w in sorted(KLINE_WEIGHT.items(), reverse=True):
+    for threshold, w in KLINE_WEIGHT_TIERS:
         if limit >= threshold:
             return w
     return 1
@@ -172,8 +174,16 @@ class BinanceRestClient:
                 data = resp.json()
             except ValueError:
                 raise BinanceRestError(f"{path} 返回非 JSON（http {resp.status_code}）: {resp.text[:200]}", status=resp.status_code) from None
-            if isinstance(data, dict) and data.get("code") and data.get("msg") and resp.status_code >= 400:
-                raise BinanceRestError(f"{path} api error {data.get('code')}: {data.get('msg')}", status=resp.status_code, code=data.get("code"))
+            if resp.is_error:
+                # 只要 HTTP ≥ 400 就是失败：错误体可能是 {"code":..,"msg":..}，
+                # 也可能是网关返回的数组/其它结构，不能因为缺 code/msg 就当成功返回
+                api_code = data.get("code") if isinstance(data, dict) else None
+                api_msg = data.get("msg") if isinstance(data, dict) else None
+                raise BinanceRestError(
+                    f"{path} http {resp.status_code}: {api_msg or str(data)[:200]}",
+                    status=resp.status_code,
+                    code=api_code,
+                )
             return data
         raise last or BinanceRestError(f"{path} failed")
 
@@ -219,11 +229,3 @@ class BinanceRestClient:
             params["endTime"] = end_ms
         rows = self._get("/fapi/v1/fundingRate", params, weight=1)
         return [parse_funding_row(r, symbol) for r in rows]
-
-
-def day_ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
-
-
-def bar_span_ms(interval: str) -> int:
-    return interval_ms(interval)

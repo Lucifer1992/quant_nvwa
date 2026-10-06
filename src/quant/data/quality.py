@@ -26,13 +26,24 @@ def htf_consistency(
     base = store.load_bars(symbol, base_interval, start_ms, end_ms)
     if base.empty:
         return []
+    # 聚合侧被窗口切开的头尾桶没有完整 OHLC，与交易所的完整高周期 bar 必然不一致，
+    # 只比对被基础数据完整覆盖的桶，否则报出来的是校验器自己的假阳性
+    covered_from = int(base.ts_open_ms.min())
+    covered_to = int(base.ts_close_ms.max()) + 1
     out: list[dict[str, Any]] = []
     for iv in htf_intervals:
         if iv == base_interval:
             continue
         step = interval_ms(iv)
         buckets = (base.ts_open_ms // step) * step
-        agg = pd.DataFrame({"close": base.close.groupby(buckets).last(), "open": base.open.groupby(buckets).first()})
+        keep = (buckets >= covered_from) & (buckets + step <= covered_to)
+        agg_src = base[keep]
+        if agg_src.empty:
+            continue
+        agg = pd.DataFrame({
+            "close": agg_src.close.groupby(agg_src.ts_open_ms // step * step).last(),
+            "open": agg_src.open.groupby(agg_src.ts_open_ms // step * step).first(),
+        })
         htf = store.load_bars(symbol, iv, start_ms, end_ms).set_index("ts_open_ms")[["open", "close"]]
         joined = agg.join(htf, how="inner", lsuffix="_agg", rsuffix="_ex")
         if joined.empty:

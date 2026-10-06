@@ -10,6 +10,7 @@ network:
 paths:
   data_dir: "data"
   reports_dir: "reports"
+  models_dir: "models"
 
 logging:
   level: "INFO"

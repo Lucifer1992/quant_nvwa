@@ -12,6 +12,13 @@ def _dec(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
+def _dec_or(value: Any, default: float) -> Decimal:
+    """交易所会把不适用的字段返回成空串（如 liquidationFee=""），不能直接喂给 Decimal。"""
+    if value is None or value == "":
+        return Decimal(str(default))
+    return _dec(value)
+
+
 def _precision(step: Decimal) -> int:
     if step == step.to_integral_value():
         return 0
@@ -44,10 +51,11 @@ def parse_symbol_spec(
     filters: dict[str, dict[str, Any]] = {f["filterType"]: f for f in payload.get("filters", [])}
     price_filter = filters.get("PRICE_FILTER", {})
     lot_size = filters.get("LOT_SIZE", {})
-    min_notional = filters.get("MIN_NOTIONAL", {}) or filters.get("MARKET_LOT_SIZE", {})
+    # MIN_NOTIONAL 才是成交额门槛；MARKET_LOT_SIZE 只有 maxQty/minQty，拿它兜底等于没有兜底
+    min_notional = filters.get("MIN_NOTIONAL", {})
 
-    tick = _dec(price_filter.get("tickSize", "0.01"))
-    step = _dec(lot_size.get("stepSize", "0.001"))
+    tick = _dec_or(price_filter.get("tickSize"), 0.01)
+    step = _dec_or(lot_size.get("stepSize"), 0.001)
 
     price_precision = int(payload.get("pricePrecision", _precision(tick)))
     qty_precision = int(payload.get("quantityPrecision", _precision(step)))
@@ -60,17 +68,19 @@ def parse_symbol_spec(
         )
 
     maint_rate = _pct(payload.get("maintMarginPercent"), default_maint_margin_rate)
-    liq_fee = _dec(payload.get("liquidationFee", default_liquidation_fee_rate))
+    liq_fee = _dec_or(payload.get("liquidationFee"), default_liquidation_fee_rate)
     req_margin = _pct(payload.get("requiredMarginPercent"), None)
     max_leverage = float(1.0 / req_margin) if req_margin else default_max_leverage
+
+    notional_raw = min_notional.get("notional") or min_notional.get("minNotional")
 
     return SymbolSpec(
         symbol=payload["symbol"],
         status=payload.get("status", "UNKNOWN"),
         tick_size=tick,
         step_size=step,
-        min_qty=_dec(lot_size.get("minQty", "0.001")),
-        min_notional=float(min_notional.get("notional", min_notional.get("minNotional", 20.0))),
+        min_qty=_dec_or(lot_size.get("minQty"), 0.001),
+        min_notional=float(notional_raw) if notional_raw not in (None, "") else 20.0,
         maint_margin_rate=maint_rate,
         max_leverage=max_leverage,
         liquidation_fee_rate=float(liq_fee),

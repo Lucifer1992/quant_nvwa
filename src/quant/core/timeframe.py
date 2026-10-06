@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 INTERVAL_MS: dict[str, int] = {
     "1m": 60_000,
@@ -62,7 +62,3 @@ def source_rank(is_closed: bool, src: str) -> int:
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
-
-
-def shift_ms(ms: int, minutes: float) -> int:
-    return ms + int(timedelta(minutes=minutes).total_seconds() * 1000)

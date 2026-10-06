@@ -79,9 +79,12 @@ class FeishuNotifier:
         self.close()
 
     def _throttle(self) -> None:
+        wait = self.cfg.min_interval_sec - (time.monotonic() - self._last_send_ts)
+        if wait > 0:
+            time.sleep(wait)
+        # 睡眠之后必须重取时钟：沿用睡前的 now 会把已经滑出窗口的记录继续计入
+        # 一分钟配额，突发几条就会抛出根本不存在的 FeishuBusy。
         now = time.monotonic()
-        if now - self._last_send_ts < self.cfg.min_interval_sec:
-            time.sleep(self.cfg.min_interval_sec - (now - self._last_send_ts))
         while self._sent_at and now - self._sent_at[0] > 60.0:
             self._sent_at.popleft()
         if len(self._sent_at) >= self.cfg.max_per_min:
@@ -114,6 +117,8 @@ class FeishuNotifier:
         for attempt in range(retries + 1):
             if attempt:
                 time.sleep(delay)
+                # 重试同样是对外 POST，必须重新过一遍最小间隔与分钟配额
+                self._throttle()
             backoff = 1.5 * 2 ** (attempt - 1)
             try:
                 resp = self._client.post(self.cfg.webhook_url, json=body)

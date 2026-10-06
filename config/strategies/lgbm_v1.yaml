@@ -1,0 +1,41 @@
+# 策略声明文件。运行时参数来自 LGBMv1Config 默认值 + CLI 选项，本文件不会被回测加载；
+# 它记录折模型位置、下注规则、标签口径与实测结论，并保持与 symbols.yaml 周期一致。
+name: lgbm_v1
+base_interval: 5m          # 引擎结算节奏（与 symbols.yaml 一致）
+decision_interval: 1h      # 模型只在 1h bar 收盘时决策
+htf: ["4h"]
+
+# 折模型：models/lgbm_v1/ETHUSDT/{tag}/model.txt + train_meta.json
+# 由 `quant train` 产出，每折只在自己的 [test_start, test_end) 内生效
+model_dir: models/lgbm_v1
+
+betting:
+  tau: 0.15            # 下注门槛 |P(up)-P(down)| > tau 才开仓
+  edge_full: 0.40      # |edge| 到这里给满仓倍数 1.0
+  min_size_mult: 0.2   # 门槛附近的最小试仓倍数
+  cooldown_bars: 12    # 两次入场信号最少间隔（5m 根）
+
+inference:
+  history_days: 90     # 特征预热回溯天数；实测与训练全长前缀差 <3e-10
+
+labels:                # 训练口径，改动即需重训（feature/label 变更会触发 spec hash 报错）
+  k_up: 3.0
+  k_dn: 2.0
+  horizon: 24
+  flat_atr_mult: 1.0
+
+engine_defaults:       # 出场对齐标签障碍，模型只管入场
+  sl_atr_mult: 2.0
+  tp_atr_mult: 3.0
+  time_stop_bars: 300
+  trail_atr_mult: 1.5
+  trail_trigger_r: 1.0
+  add_trigger_r: 1.0
+
+# 实测结论（2026-10-07 保守口径重跑，ETHUSDT 2026-04-01~10-01 样本外）：
+#   方向命中率 47.8%（验证月 57.8%），全部 tau × 是否做空组合均为负收益；
+#   tau=0.15 回测 -23.75%（136 笔，胜率 44.1%，PF 0.47）。
+#   同期 rule_v4 +12.08%、买入持有约 +27%。
+#   （2026-10-06 记录的 rule_v4 +18.98% 是账本修复前口径，与新数字不可比；
+#     口径见 docs/technical-implementation.md §13）
+#   结论：当前 38 维特征在 24h 障碍上没有可交易的样本外 edge，保留用于 paper 观察。

@@ -12,6 +12,8 @@ BarSource = Literal["rest", "ws"]
 class Action(StrEnum):
     OPEN_LONG = "open_long"
     OPEN_SHORT = "open_short"
+    ADD_TO_LONG = "add_to_long"
+    ADD_TO_SHORT = "add_to_short"
     CLOSE_LONG = "close_long"
     CLOSE_SHORT = "close_short"
 
@@ -30,6 +32,7 @@ class Side(StrEnum):
 class FillReason(StrEnum):
     SIGNAL = "signal"
     SL = "sl"
+    TP = "tp"
     TP1 = "tp1"
     TP2 = "tp2"
     TRAIL = "trail"
@@ -131,6 +134,15 @@ class RiskDecision:
 
 
 @dataclass
+class AddLevel:
+    """单次加仓记录（含试仓）。"""
+    price: float
+    qty: float
+    ts: datetime
+    fee_usdt: float = 0.0
+
+
+@dataclass
 class Position:
     position_id: str
     symbol: str
@@ -152,6 +164,15 @@ class Position:
     breakeven_done: bool = False
     extreme_price: float | None = None
     status: Literal["open", "closed"] = "open"
+    # ---- 金字塔加仓扩展字段 ----
+    target_qty: float = 0.0          # 目标满仓 qty
+    avg_entry_price: float = 0.0     # 加权平均入场价（加仓后变化）
+    add_count: int = 0               # 已加仓次数（不含试仓）
+    add_levels: list[AddLevel] = field(default_factory=list)  # 各批次入场记录
+    trailing_active: bool = False    # 移动止损是否激活
+    trailing_peak_price: float = 0.0 # 移动止损追踪的极值（多头最高/空头最低）
+    base_stop_price: float = 0.0     # 原始止损价（用于统计）
+    tp_price: float = 0.0           # 止盈价（0 表示未设）
 
 
 @dataclass
