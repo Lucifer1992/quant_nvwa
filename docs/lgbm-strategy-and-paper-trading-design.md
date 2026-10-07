@@ -1,6 +1,15 @@
 # LightGBM 策略（lgbm_v1）+ 多策略模拟交易信号服务 · 技术设计
 
-状态：**待确认决策点，未开始编码**（见 §10）
+状态：**已实现（lgbm_v1 全链路 + `src/quant/paper/` 服务，2026-10-07）**。§10 的决策点答案与
+落地后的偏差记录在 §11（实测结论）与 §8.9（实现 vs 本文的差异）；工程细节现行版本以
+`docs/technical-implementation.md` §15/§16 为准。
+
+> **口径注记（2026-10-07 第 2 轮）**：本文正文里的对照数字（rule_v4 半年 **+18.98% / −12.39%**、
+> §11.4 的 τ 扫描表）是编写当时的口径 —— 账本与前视/滑点修复之前、**计资金费、TP1/保本/强平尚未实现**。
+> 第 2 轮（现行，剔除资金费 + TP1 默认开）同一窗口：**+4.79%（64 条流水）/ TP1 关 +12.42%（45 笔）**，
+> `lgbm_v1` 默认参数 −20.59%（189 条流水）。**本文的结论没变**：ML 把频率提上来了，
+> 但样本外方向命中率仍在抛硬币区间，没有可交易的 edge。
+
 关联：`docs/rule_v4-trend-design.md`（同区间同口径的对照组）、`docs/strategy-base-design.md`、`docs/quant_platform_design.md`
 
 ---
@@ -291,6 +300,21 @@ bar 收盘对齐唤醒（决策周期 closeTime < 交易所 server_now，再等 
 | 进程崩溃 | 重启从 checkpoint 续，`signal_id` 唯一键保证不重发 |
 | 时钟漂移 | 以 `server_time_ms` 为准；本地时钟只做日志 |
 
+### 8.9 落地实况与本文的差异（2026-10-07 回填，权威描述见 `docs/technical-implementation.md` §15）
+
+| 本文的设想 | 实际落地 | 为什么改 |
+|---|---|---|
+| 新 bar 逐根喂，"不重放历史" | checkpoint 之前 `replay_days=7` 天以 `mode="observe"` **重放**：只调策略、账本一行不写 | 策略有隐藏状态（rule_v4 的 1h 趋势状态机、冷却计数、ML 特征帧）。不重放的话重启后状态从零开始，第一根 live bar 的判定与断点处不一致 |
+| `signal_id = sha1(symbol\|strategy\|action\|ts_open\|seq)` | 可读的 `{symbol}:{strategy}:{signal_id}:{kind}`；平仓 `{position_id}:{reason}:{exit_time_ms}`；告警 `{…}:alert:{tag}` | hash 出问题时人读不出来；带 `reason:exit_time` 是因为一个仓位会有 TP1 + 全平**两条**流水，否则主键互相撞掉、少推卡片 |
+| 4 张表 | **5 张**：多一张 `paper_trades` | 回撤/连亏闸门要"最近 N 笔的结果"，`paper_signals` 记的是意图而不是成交结果；已实现盈亏也要有权威流水 |
+| `dataset_version` 匹配才允许跑（§8.8） | 只用于**记录**，不作闸门；ML 用"当前时刻是否落在某折 `[test_start,test_end)`"判可用 | paper 每轮都在增量拉数据，版本串必然变化，拿它当闸门等于永远拒绝服务 |
+| 闸门"只告警不拦截" | **拦截新开仓**（试仓与加仓），绝不强平已有持仓 | 用户 2026-10-06 明确要求。出场路径必须与回测逐位一致，否则纸面数字失去参考价值 |
+| 未定的 TP1/保本/强平 | 全部落在共用执行层 `backtest/position.py`，回测与 paper 同序 | 同一根 bar 可以既吃 1R 部分止盈又吃 3.5R 全平，所以 `settle_price_exits` 返回**事件列表** |
+| 成本含资金费 | 默认**不计**（`include_funding=False`），数据仍加载供 ML 特征用 | 10× 下资金费约 0.24%/3 天，而往返手续费是保证金的 1%（滑点后约 1.4%）。量级太小、只引入无关变量 |
+| `paper.sh add-strategy` | 未做该子命令；改 `config/symbols.yaml` 的 `strategies: [rule_v4, lgbm_v1]` 后 `restart` | 品种×策略列表本来就是配置驱动，脚本再加一层写文件的操作容易和 git 冲突 |
+
+首轮行为（部署后第一次 `paper once` 看到"实撮 0 根"是正常的）：没有断点时全部 bar 都落在 observe 区间，账本从第二轮的 checkpoint 之后才开始成交。
+
 ---
 
 ## 9. 里程碑与顺序（每步都有可验证产物）
@@ -325,7 +349,7 @@ bar 收盘对齐唤醒（决策周期 closeTime < 交易所 server_now，再等 
 |---|---|---|
 | Q1 决策周期 | **1h** | `MLBaseStrategy.decision_interval = "1h"`，`required_intervals=("5m","1h","4h")` |
 | Q2 训练窗口 | **滚动 12 个月** | `TrainConfig.window_months=12`，`plan_folds()` 每折 train 12M / valid 1M / test 1M |
-| Q3 服务形态 | **单进程多策略** | `src/quant/paper/`，见 §12 |
+| Q3 服务形态 | **单进程多策略** | `src/quant/paper/`，实现状态见 `docs/technical-implementation.md` §15 |
 | Q4 纸面账户 | **每策略独立 100U** | `paper_accounts` 表按 `(strategy, symbol)` 记账 |
 | Q5 模型更新 | **本地训练 + 上传工件** | 服务器只读 `models/{name}/{symbol}/{tag}/`，不装训练依赖 |
 
@@ -345,6 +369,12 @@ bar 收盘对齐唤醒（决策周期 closeTime < 交易所 server_now，再等 
 | 账本恒等式 | `sum(trades.pnl)` vs 净值增长 | 误差 0.000（全部 τ × 方向组合） |
 
 ### 11.4 样本外结果：当前特征集没有可交易的 edge
+
+> **口径注记（2026-10-07 回填）**：下表与末行对照都是**第 1 轮口径**（计资金费、无 TP1/保本/强平触发）的实测。
+> 成本模型与出场层后来改过一轮，现行数字见 `docs/technical-implementation.md` §16：
+> `lgbm_v1` 半年 **−20.59% / 189 笔 / PF 0.54**、全历史 **−22.03% / 207 笔 / PF 0.55**；
+> `rule_v4` 半年 **+4.79%**（TP1 默认）/ **+12.42%**（TP1 关）。
+> **结论方向不变**：所有 τ 组合样本外皆负，负收益不是接线问题也不是成本问题。
 
 评估区间 2026-04-01 ~ 2026-10-01（ETHUSDT，100U，10×，taker + 2bp 滑点，保守口径）：
 

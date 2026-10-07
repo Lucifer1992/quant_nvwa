@@ -3,10 +3,14 @@
 > 本文是**当前代码实现状态**的唯一权威说明：以实际代码与实测数据为准，不是设计意图的复述。
 > 设计决策的论证过程见 `docs/` 下其余设计文档；与本文冲突时，以本文为准（本文对齐 2026-10-07 的代码）。
 
-- 代码基线：`master`，`git ls-files` 之上另有 40 个未提交文件（用户要求：本轮不提交 git）
-- 校验状态：`uv run pytest -q` → **147 passed**；`uv run ruff check --select F,E9 src tests` → clean
+- 代码基线：`master`。paper 服务 + TP1/保本/强平 + 剔除资金费这批改动已于 2026-10-07 入库
+  （`feat:` 代码提交 + `docs:` 文档提交各一条）；工作区仅剩 `models/`（9.0 MB 折模型）未跟踪，
+  "提交 vs gitignore"待用户决定。**push 仍需用户显式授权**
+- 校验状态：`uv run pytest -q` → **213 passed**；`uv run ruff check --select F,E9 src tests` → clean
 - 数据基线：`data/quant.db`，ETHUSDT 5m/15m/1h/4h/1d + funding，2024-01-01 起
-- 可比性声明：**本文第 13 节列出的修复之前的所有回测数字都不可与现在的数字比较**（口径变了，不是策略变差了）
+- 可比性声明：回测口径改过**两轮**，跨轮次的数字一律不可比较，只能在同一轮内做相对排序
+  - 第 1 轮（2026-10-04，前视/保证金/滑点修复）：第 13.3 节表格里"修复前"那一列全部作废
+  - 第 2 轮（2026-10-07，**成本模型剔除资金费** + **TP1 分批止盈/保本移动/强平触发落地**）：13.3 节"修复后"那一列也随之作废，现行数字见 §16 基线表
 
 ---
 
@@ -38,22 +42,32 @@ risk/        exchange_meta.py（exchangeInfo → SymbolSpec 解析与序列化�
              sizing.py（compute_risk_size：唯一定仓实现 + 强平价近似）
 features/    indicators.py（ema/atr/macd/rsi/stoch_rsi/bollinger/adx）
              builder.py（38 维 ML 特征帧 + triple-barrier 标签，训练/推理共用）
-backtest/    engine.py（事件驱动撮合 + 账本 + 指标）
+backtest/    position.py（**回测与 paper 共用的执行层**：纯触发函数 + PositionLedger + BarPipeline + HtfCursor）
+             precompute.py（5m / 高周期指标预计算 + row_to_bar + warmup_bars）
+             engine.py（只做数据准备与驱动，撮合全部委托给 BarPipeline）
              reports.py（equity.csv / trades.csv / metrics.json / report.html + 多周期 K 线）
 strategy/    base.py（BaseStrategy 契约）  registry.py（@register 自动发现）
              rules/rule_v1..v4.py
              ml/base.py（MLBaseStrategy：折模型加载、特征帧、edge 推理）  ml/lgbm_v1.py
 train/       walkforward.py（plan_folds / fold_masks / 训练 / edge 扫描 / 折报告）
-notify/      feishu.py（webhook + 签名 + 限流退避）  cards.py（入场卡片构造与样例）
+paper/       config.py（PaperConfig ≡ BacktestConfig + GuardThresholds + PaperRuntime）
+             state.py（PaperState：账本↔SQLite 双向还原 + 确定性主键）
+             guards.py（EntryGuards：`[paper]` 事前闸门，只拦新开仓）
+             runner.py（一个 (symbol,strategy) 的一轮：观测→实撮→落库→推送）
+             service.py（PaperService：单进程多账户调度 + paper_status）
+notify/      feishu.py（webhook + 签名 + 限流退避）  cards.py（入场/平仓/告警卡片 + exit_label）
 infra/       settings.py（YAML 分层加载 + validate_config）  log.py
 cli.py       typer 应用：backfill / check-data / exchange-info / test-card / dump-card / backtest / train
+             + `paper run|once|status` 子命令组
+scripts/paper.sh            start|stop|restart|status|once|logs（PID 文件 + 预检 + TERM 优雅退出）
+deploy/paper-trading.service  systemd 模板（Restart=always；无 WatchdogSec，进程不发 sd_notify）
 ```
 
 ### 1.3 实现状态
 
-**已实现并实测**：REST 数据层与断点续传、SQLite 落库与质量闸门、5m/1h/4h 多周期事件驱动回测、固定风险定仓、金字塔加仓、移动止损、资金费计提、飞书卡片、4 个规则策略 + LightGBM walk-forward 训练与推理、HTML 多周期 K 线报告、147 项离线单测。
+**已实现并实测**：REST 数据层与断点续传、SQLite 落库与质量闸门、5m/1h/4h 多周期事件驱动回测、固定风险定仓、金字塔加仓、移动止损、**TP1 分批止盈 + 保本移动 + 强平价触发平仓**、飞书卡片、4 个规则策略 + LightGBM walk-forward 训练与推理、HTML 多周期 K 线报告、**模拟交易/信号推送服务（§15）与 213 项离线单测**、`scripts/paper.sh` + systemd 模板（本机实跑验证过 start/once/status/stop，全程 `--no-push`）。
 
-**未实现（明确不做或延后）**：WebSocket/1m 数据、模拟交易服务与 shell 启动脚本（§15）、TP1 分批止盈与保本移动、`caps`/`guard` 中的 `[paper]` 风控闸门、强平价触发平仓、多品种并行回测（BTCUSDT 未回填）。
+**未实现（明确不做或延后）**：WebSocket/1m 数据、真实下单（由人手动执行）、多策略仓位共存与跨策略合并保证金（用户明确"先不管"）、多品种并行回测（BTCUSDT 未回填）、`backtest.intra_bar_path=exact_1m`（需要 1m 数据）、Web UI。
 
 ---
 
@@ -63,7 +77,7 @@ cli.py       typer 应用：backfill / check-data / exchange-info / test-card / 
 - 运行时依赖：`httpx`、`pandas 3.0.6`、`numpy 2.5.3`、`pyyaml`、`python-dotenv`、`typer`、`plotly 7.1`、`pyecharts 2.1`、`lightgbm 4.7.0`、`scikit-learn 1.9`
 - 开发依赖组：`pytest`、`hypothesis`、`ruff`
 - 入口：`[project.scripts] quant = "quant.cli:app"` → `uv run quant <cmd>`
-- 目录约定：`data/`（SQLite，gitignore）、`reports/`（回测产物，gitignore）、`logs/quant.log`、`models/`（折模型，**当前未被 gitignore 覆盖**，9.0 MB）
+- 目录约定：`data/`（SQLite，gitignore）、`reports/`（回测产物，gitignore）、`logs/`（`quant.log` + `paper.out` + 临时校验脚本，gitignore）、`run/`（`paper.pid`，gitignore）、`models/`（折模型，**当前未被 gitignore 覆盖**，9.0 MB）
 
 ### 2.1 网络出网规则（实测硬约束）
 
@@ -96,15 +110,23 @@ cli.py       typer 应用：backfill / check-data / exchange-info / test-card / 
 - `sizing.method=fixed_risk` 必须有 `risk_pct`
 - `stops.tp_atr_mult > sl_atr_mult`（否则盈亏比结构性为负）
 
-### 3.2 纯文档键（当前代码不读取，不要误以为生效）
+### 3.2 键的生效范围（回测与 paper 读的不是同一套）
 
-| 键 | 状态 |
-|---|---|
-| `network.resync_grace_ms` | 仅文档：REST 覆盖 WS 尾 bar 的等待窗口，WS 未实现 |
-| `backtest.intra_bar_path` | 仅文档：`bar_hl`（当前口径）/ `exact_1m`（1m 数据回填后才可切换） |
-| `caps.max_notional_usdt`、`caps.max_margin_per_symbol_pct`、`caps.max_new_entries_per_day` | `[paper]`，回测未强制 |
-| `guard.*`（日亏停、回撤暂停、连亏次数、冷却、数据新鲜度） | `[paper]`，回测不生效 |
-| `stops` 中注释掉的 `tp1_r` / `breakeven_after_r` / `trail_atr_mult` | 未实现，只记录设计意图 |
+| 键 | 回测 | paper |
+|---|---|---|
+| `caps.global_max_leverage` | 读（`--lev` 默认值） | 读 |
+| `caps.max_notional_usdt`、`caps.max_margin_per_symbol_pct`、`caps.max_new_entries_per_day` | **不生效**（回测要的是策略裸表现） | **拦截新开仓**（`paper/guards.py`），不强平已有持仓 |
+| `guard.*`（日亏停、回撤暂停、连亏冷却、数据新鲜度） | **不生效** | 同上；冷却到期时刻落库 `paper_accounts.pause_until_ms` |
+| `stops.tp1_r` / `tp1_close_frac` / `breakeven_after_r` | 生效（`<=0` 关闭） | 生效（同一执行层） |
+| `costs.include_funding` | 生效（**默认 false**） | 生效（默认 false） |
+| `network.resync_grace_ms` | 仅文档（REST 覆盖 WS 尾 bar 的等待窗口，WS 未实现）；paper 的 `_pull` 用它判断"最新收盘 bar 该不该已落库" |
+| `backtest.intra_bar_path` | 仅文档：`bar_hl`（当前口径）/ `exact_1m`（1m 数据回填后才可切换） | 同 |
+| `paper.replay_days` / `paper.poll_sec` | 回测不读 | paper 调度参数 |
+| `feishu.resend_cooldown_min` | 不读 | 补发退避（`_resend_unsent`） |
+
+`PaperConfig` 的字段名与默认值必须和 `BacktestConfig` 完全一致（`start`/`end` 除外：纸面账户只有断点，没有回测窗口）。这条约束由 `tests/test_paper_runner.py::TestConfigParity` 逐字段断言守住 —— 两份配置只要漂移一个名字，paper 就会静默用错止损倍数。
+
+配套的 `_warn_yaml_drift()`：`risk.yaml` 声称的口径与实际生效值不一致时 WARNING（回测 CLI 从不读 `costs.*`，改 YAML 会让两边静默分叉，而可比性是纸面账户唯一的存在意义）。
 
 ---
 
@@ -142,6 +164,8 @@ funding(symbol, funded_at_ms, funding_rate, mark_price, rate_type, interval_h, s
      PRIMARY KEY(symbol, funded_at_ms))
 meta(key PRIMARY KEY, value)     -- 交易规则缓存：key = "spec:{symbol}"
 ```
+
+另有 5 张 paper 表（`paper_accounts / paper_positions / paper_signals / paper_trades / paper_checkpoints`），列清单见 §15.4。建表用 `CREATE TABLE IF NOT EXISTS`，老库补列走 `PAPER_MIGRATIONS`（`paper_accounts` 的 `peak_equity`、`pause_until_ms`）+ `ALTER TABLE`，重复打开同一个库不报错。
 
 - WAL 模式；连接级复用；`upsert_bars` 的守卫是 `ON CONFLICT ... WHERE excluded.prio >= bars.prio`
 - `prio = source_rank(is_closed, src) = 2*is_closed + (src=="rest")`，因此**已收盘 REST 覆盖未收盘 WS**，同优先级允许重写（幂等重放），更低优先级永远不能覆盖更高优先级
@@ -181,12 +205,14 @@ meta(key PRIMARY KEY, value)     -- 交易规则缓存：key = "spec:{symbol}"
 
 | 品种 | 周期 | 行数 | 已收盘 | 范围（UTC） |
 |---|---|---|---|---|
-| ETHUSDT | 5m | 289,611 | 289,611 | 2024-01-01 00:00 → 2026-10-02 14:10 |
+| ETHUSDT | 5m | 291,015 | 291,015 | 2024-01-01 00:00 → 2026-10-07 11:10 |
 | ETHUSDT | 15m | 96,517 | 96,517 | 2024-01-01 00:00 → 2026-10-02 09:00 |
-| ETHUSDT | 1h | 24,129 | 24,129 | 2024-01-01 00:00 → 2026-10-02 08:00 |
-| ETHUSDT | 4h | 6,032 | 6,032 | 2024-01-01 00:00 → 2026-10-02 04:00 |
+| ETHUSDT | 1h | 24,251 | 24,251 | 2024-01-01 00:00 → 2026-10-07 10:00 |
+| ETHUSDT | 4h | 6,062 | 6,062 | 2024-01-01 00:00 → 2026-10-07 04:00 |
 | ETHUSDT | 1d | 1,005 | 1,005 | 2024-01-01 00:00 → 2026-10-01 00:00 |
-| ETHUSDT | funding | 3,017 | — | 2024-01-01 00:00 → 2026-10-02 08:00 |
+| ETHUSDT | funding | 3,032 | — | 2024-01-01 00:00 → 2026-10-07 08:00 |
+
+paper 侧（同一库）：`paper_accounts` 1 行、`paper_checkpoints` 1 行、`paper_signals` 4 行（全是演练期告警）、`paper_positions` 与 `paper_trades` 各 0 行 —— 本机只跑到"首轮只观察"，还没有真实成交。
 
 `src` 全为 `rest`（WS 未实现）。缓存规则：`tick=0.01 step=0.001 min_qty=0.001 min_notional=20.0 maint=0.025 max_lev=20 liq_fee=0.0125 fetched_at=2026-10-02T09:23:57Z`。
 
@@ -194,12 +220,13 @@ meta(key PRIMARY KEY, value)     -- 交易规则缓存：key = "spec:{symbol}"
 
 ## 5. 特征层
 
-### 5.1 回测引擎预计算列
+### 5.1 预计算列（`backtest/precompute.py`，回测与 paper 共用）
 
-- 5m（`engine._precompute`，一次性 O(n)）：`ema_9/12/20/50/60`、`atr`、`macd/macd_signal/macd_hist/prev_macd_hist`、`prev_close/prev_ema_20`、`rsi_14`、`srsi_k/srsi_d/prev_srsi_k`、`bb_mid/upper/lower`、`adx_14`、`atr_median`、`vol_median`、`swing_high/swing_low`（`rolling(swing_window).max().shift(1)`，**不含当前 bar**）
-- 高周期（`engine._precompute_htf`）：`ema_12/20/60`、`macd_hist/prev_macd_hist`、`srsi_k/d/prev_srsi_k`、`atr`、`rsi_14`、`adx_14/prev_adx_14/adx_prev_3`、`ema_20_prev_6`（rule_v4 算斜率）、`atr_median_100`（波动扩张）、`donchian_high_24/low_24`
+- 5m（`precompute(df, swing_window=12)`，一次性 O(n)）：`ema_9/12/20/50/60`、`atr`、`macd/macd_signal/macd_hist/prev_macd_hist`、`prev_close/prev_ema_20`、`rsi_14`、`srsi_k/srsi_d/prev_srsi_k`、`bb_mid/upper/lower`、`adx_14`、`atr_median`、`vol_median`、`swing_high/swing_low`（`rolling(swing_window).max().shift(1)`，**不含当前 bar**）
+- 高周期（`precompute_htf(df)`）：`ema_12/20/60`、`macd_hist/prev_macd_hist`、`srsi_k/d/prev_srsi_k`、`atr`、`rsi_14`、`adx_14/prev_adx_14/adx_prev_3`、`ema_20_prev_6`（rule_v4 算斜率）、`atr_median_100`（波动扩张）、`donchian_high_24/low_24`
+- `row_to_bar(row, symbol, interval)` 把指标帧的一行还原成 `Bar` 契约对象；`warmup_bars()` 返回 3120（见 §7.2），paper 用它换算加载窗口的前置长度
 
-所有滚动量右移一位或按可见时刻对齐，无前视。
+所有滚动量右移一位或按可见时刻对齐，无前视。两个函数**原地改传入的 DataFrame**，调用方需先 `sort_values("ts_open_ms").reset_index(drop=True)`（paper 的 `_load_frames` 返回的帧顺序不保证，见 §13.4 第 1 条修复）。
 
 ### 5.2 ML 特征（`features/builder.py`，固定 38 维，顺序即模型输入顺序）
 
@@ -255,43 +282,49 @@ meta(key PRIMARY KEY, value)     -- 交易规则缓存：key = "spec:{symbol}"
 保证金口径注释是硬约束：不能写成 `margin = notional / (notional / equity)`（恒等于 equity），那会让每笔成交把全部权益记成保证金、`ret_pct` 退化成对权益的收益率、现金账户被抽干。
 
 **强平价近似**（逐仓，不计资金费与持仓期收益）：
-`long: entry × (1 − 1/lev + maint + taker_fee)`，`short: entry × (1 + 1/lev − maint − taker_fee)`。10× / maint 2.5% → 多头约在 −7.45% 价格处强平。回测**不模拟强平触发**（见 §14）。
+`long: entry × (1 − 1/lev + maint + taker_fee)`，`short: entry × (1 + 1/lev − maint − taker_fee)`。10× / maint 2.5% → 多头约在 −7.45% 价格处强平。**强平触发已实现**（`FillReason.LIQ`，见 §7.5b）。
+
+`decide_position(...)` 是回测与 paper 唯一的 `RiskDecision` 构造入口（卡片上的数量与账本里的数量必须同源），`est_liq_price` 随决策一起返回、试仓时写进 `Position.liq_price`。**加仓后不重算 `liq_price`** —— 加权均价变化会让真实强平价移动，这条近似记在 §14 第 2 条。
 
 ---
 
-## 7. 回测引擎（`backtest/engine.py`）
+## 7. 执行层与回测引擎（`backtest/position.py` + `backtest/engine.py`）
 
 ### 7.1 配置（`BacktestConfig` 默认值）
 
 ```
-symbol, base_interval=5m, start, end, initial_equity=100, mode,
+symbol, base_interval=5m, start, end, initial_equity,
 risk_pct=0.01, sl_atr_mult=1.5, tp_atr_mult=3.0, time_stop_bars=96,
 allow_short=True, global_max_leverage=10.0, taker_fee=0.0005, slippage_bps=2.0,
-include_funding=True, sl_first_on_conflict=True, strategy_name="rule_v1",
+include_funding=False, sl_first_on_conflict=True, strategy_name="rule_v1",
 pyramid_enabled=True, entry_frac=0.10, add_frac=0.20, add_max_count=2,
-add_trigger_r=0.3, trail_trigger_r=1.0, trail_atr_mult=1.0, swing_lookback=12
+add_trigger_r=0.3, trail_trigger_r=1.0, trail_atr_mult=1.0, swing_lookback=12,
+tp1_r=1.0, tp1_close_frac=0.5, breakeven_after_r=1.0
 ```
 
-策略可通过 `engine_defaults()` 覆盖出场/节奏默认值（CLI 显式传参优先于策略声明）。
+策略可通过 `engine_defaults()` 覆盖出场/节奏默认值（CLI 显式传参优先于策略声明）。`PaperConfig` 与它同名同默认值，只有 `start`/`end` 换成断点，所以同一套 `position.py` 撮合两条链路（§15.2）。
 
-### 7.2 时间线（每根 5m bar 一次迭代，`run()`）
+### 7.2 时间线（每根 5m bar 一次迭代，`BarPipeline.on_bar`）
 
 ```
-i.   弹出所有"可见时刻 <= 本根收盘"的 1h / 4h bar → htf dict（指针只前进不回退）
+i.   HtfCursor.advance(可见时刻 = bar.ts_close + 1) → htf dict（指针只前进不回退）
 ii.  equity_open = equity                       ← 本根开盘前已知的净值，定仓只用它
-iii. MTM 快照（有持仓则 _update_mtm，无持仓 equity=cash），记入 equity_curve
-iv.  _accrue_funding(可见时刻, close)            ← 指针每根都推进，含预热期与空仓期
-v.   i < warmup → continue                       （warmup = 3120 根 5m ≈ 10.8 天）
-vi.  执行上一根 bar 收盘产生的信号：在本根 bar 开盘成交（pending_signal）
-vii. _update_trailing_stop(bar)
-viii._check_exits(bar)：SL / TP（同根双触发按 sl_first_on_conflict 定序）
-ix.  持仓根数 >= time_stop_bars → 市价平仓（按 close ± 不利滑点）
-x.   signal = strategy.on_bar(bar, row, htf, dt) → pending_signal
+iii. snapshot(bar)：MTM 净值快照，记入 equity_curve
+iv.  accrue_funding(可见时刻, close)             ← 指针每根都推进，含预热期与空仓期
+v.   mode != "live" → 到此为止（warmup 不撮合、不调策略）
+vi.  执行上一根 bar 收盘产生的信号：在本根 bar 开盘成交（pending）
+vii. update_trailing(pos, cfg, bar)
+viii.settle_exits(bar) = settle_price_exits + advance_time_stop：
+        SL（bar 极值） → 若未触发则 LIQ（强平价） → TP1 部分止盈 + 保本移动
+        → 保本后新止损在同根 bar 立即参与判定 → TP → 时间止损
+ix.  signal = signal_fn(bar, row, htf, ts_close) → pending
 ```
 
-循环结束若仍持仓 → `FillReason.FLAT` 平仓，并**回写最后一个净值点**（循环内快照是持仓 MTM，不含这笔的滑点/平仓费/资金费，否则尾部差一个量导致恒等式破）。
+`mode` 三档：`live`（完整序列）、`warmup`（只做净值快照与资金费记账，回测窗口最前面那段）、`observe`（只调策略、丢弃返回值、账本一行不写 —— paper 重启用它把策略内部状态推平到断点，绝不能出现在回测里）。
 
-`warmup = max(4h/5m × 65, 1h/5m × 35, 30) = max(48×65=3120, 12×35=420, 30) = 3120`：规则策略的加载窗口不带前置历史，起点处 4h EMA60 / ADX14 仍是 NaN，必须留预热段。ML 策略 `warmup()=0`，改用 `history_lookback()`（90 天）让引擎多加载前缀。
+回测里 `warmup` 的判定是 `i < warmup_bars()`；`warmup = max(4h/5m × 65, 1h/5m × 35, 30) = max(48×65=3120, 12×35=420, 30) = 3120` 根 5m ≈ 10.8 天：规则策略的加载窗口不带前置历史，起点处 4h EMA60 / ADX14 仍是 NaN，必须留预热段。ML 策略 `warmup()=0`，改用 `history_lookback()`（90 天）让引擎多加载前缀。
+
+循环结束若仍持仓 → `FillReason.FLAT` 平仓（`pipeline.finalize(bar)`），并**回写最后一个净值点**（循环内快照是持仓 MTM，不含这笔的滑点/平仓费/资金费，否则尾部差一个量导致恒等式破）。
 
 ### 7.3 成交与成本口径（全部取不利方向）
 
@@ -299,8 +332,10 @@ x.   signal = strategy.on_bar(bar, row, htf, dt) → pending_signal
 |---|---|---|
 | 入场（试仓/加仓） | `bar.open × (1 ± slippage_bps)` | 该 5m bar 的 `ts_close` |
 | 信号平仓 / 反手 | `bar.open × (1 ∓ slip)` | 同上 |
-| **止损（B 模式）** | `bar.low`（多）或 `bar.high`（空）再减/加 slip | **bar 中点** `_bar_mid` |
+| **止损（B 模式）** | `bar.low`（多）或 `bar.high`（空）再减/加 slip | **bar 中点** `bar_mid` |
 | 止盈 | `pos.tp_price ∓ slip` | bar 中点 |
+| **TP1 部分止盈** | `avg_entry ± sl_atr_mult × entry_atr × tp1_r`，再取不利滑点 | bar 中点 |
+| **强平** | `pos.liq_price ∓ slip`（逐仓被打穿，没有讨价还价余地） | bar 中点 |
 | 时间止损 / 期末平仓 | `bar.close ∓ slip` | bar 收盘 |
 
 - 止损按 bar 极值成交是"最坏情况"假设：一根 bar 内无法证明价格先到哪侧，按 TP 成交会把本该止损的交易记成盈利，属系统性乐观偏差
@@ -312,16 +347,42 @@ x.   signal = strategy.on_bar(bar, row, htf, dt) → pending_signal
 ### 7.4 仓位与加仓
 
 - 试仓：新建 `Position`，`cash -= margin + 开仓腿手续费`，手续费记在 `add_levels[0].fee_usdt`
-- 加仓（`_should_add`）：`add_count < add_max_count` ∧ `unreal_r >= add_trigger_r` ∧ 结构突破（多头 `close > swing_high`，空头 `close < swing_low`，swing 已 `shift(1)`）；成功后加权均价、qty、margin、`add_levels` 累加，并把 SL 上移到 `avg_entry ± sl_atr_mult × entry_atr`（只朝有利方向）
-- 移动止损：极值 `trailing_peak_price` 每根更新，`unreal_r >= trail_trigger_r` 激活，激活后 `stop_loss = max/min(prev, peak ∓ trail_atr_mult × entry_atr)`
+- 加仓（`should_add`）：`add_count < add_max_count` ∧ `unreal_r >= add_trigger_r` ∧ 结构突破（多头 `close > swing_high`，空头 `close < swing_low`，swing 已 `shift(1)`）；成功后加权均价、qty、margin、`add_levels` 累加，`sync_stop_after_add` 把 SL 上移到 `avg_entry ± sl_atr_mult × entry_atr`（只朝有利方向）
+- 移动止损（`update_trailing`）：极值 `trailing_peak_price` 每根更新，`unreal_r >= trail_trigger_r` 激活，激活后 `stop_loss = max/min(prev, peak ∓ trail_atr_mult × entry_atr)`
 - 反手：在同一根 bar 开盘先平对向仓（`eq = cash`），再开新仓
+- paper 专属的一处差别：开/加仓在撮合前多一道 `ledger.approve_fn`（`EntryGuards.vetoes`）追加否决理由；回测把它留 `None`，所以**逐笔成交序列与同参数回测逐位相同**（`tests/test_paper_runner.py::TestBacktestParity` 锁住）
 
-### 7.5 资金费计提
+### 7.5 资金费（机制保留，默认**不计入净值**）
 
-- 指针 `_funding_ptr` 每根 bar 推进（**包括空仓与预热期**，否则空仓期间的结算会被算进之后才开的仓位）
+`include_funding` 默认 `False`：实测 ETHUSDT 2026-04~10 的资金费在 10× 下只占保证金约 0.24%/3 天，而往返 taker 手续费是保证金的 1%（名义万 5 × 2 / 杠杆 10）。量级太小、又要额外维护一根结算指针，用户决定**回测与 paper 都把它从成本模型里去掉**，避免引入无关变量。资金费数据照常入库、`_load_frames` 照旧加载（ML 特征 `funding_rate/funding_annual/mark_basis/hrs_to_funding` 仍要用）。
+
+开关打开时的计提实现（三条不变量，回归测试覆盖）：
+
+- 指针 `_funding_ptr` 每根 bar 推进（**包括空仓与预热期**，否则空仓期间的结算会被算进之后才开的仓位）；`seek_funding(None)` 表示首轮没有断点，指针归 0（**不能**把 `None` 喂给 `searchsorted`，见 §13.4 第 3 条）
 - `cost = qty × mark_price(优先) 或 close × rate`，多头为正（付费）、空头为负（收费），费率非有限或为 0 跳过
 - 只累计到 `funding_since_entry` 与 `pos.funding_paid`，**现金在平仓时经 `net_cash` 一次性扣除**，避免持仓期与平仓时重复扣款
-- `include_funding=False` 可关闭
+
+### 7.5b 分批止盈、保本移动与强平触发
+
+同一个 `settle_price_exits(bar)` 返回**事件列表**：一根 bar 里可以既吃到 1R 的部分止盈、又吃到 3.5R 的全平。判定顺序（保守优先，逐条有测试）：
+
+1. `exit_reason`：SL 与 TP 双触发时按 `sl_first_on_conflict` 定序，默认取 SL → 全平，**后续环节不再评估**
+2. 未触发任何价位时 `liq_hit`：`bar.low ≤ liq_price`（多）或 `bar.high ≥ liq_price`（空）→ `FillReason.LIQ` 全平
+3. `settle_tp1`：`tp1_r > 0` 且未 `tp1_done` 且价格越过 `avg_entry ± sl_atr_mult × entry_atr × tp1_r` → 先置 `tp1_done`、再 `apply_breakeven` 把止损抬到加权开仓价，然后按 `step_size` 向下取整平掉 `tp1_close_frac`，记 `FillReason.TP1`
+   - 余量或平仓量低于 `min_qty` 时**只标记 `tp1_done` 不重试**（100U 小本金的试仓阶段经常出现），保本移动照样生效
+4. 保本后的新止损在**同一根 bar** 立即参与判定（与移动止损收紧后按 bar 极值判触发是同一套保守约定）
+5. TP 命中 → 全平
+
+`tp1_r<=0` 关闭分批止盈、`breakeven_after_r<=0` 关闭保本移动，两者回测与 paper 都读同一个字段名。
+
+**成本对照实测**（ETHUSDT 2026-04→10，100U，同一策略 rule_v4，只改 TP1 开关）：
+
+| 口径 | 收益 | CAGR | maxDD | 笔数 | 胜率 | 盈亏比 | PF |
+|---|---|---|---|---|---|---|---|
+| TP1 开（默认 1R 平一半 + 保本） | **+4.79%** | +9.77% | −12.44% | 64 | 64.1% | 0.62 | 1.10 |
+| TP1 关（`--tp1-r 0 --breakeven-r 0`，已复跑验证） | **+12.42%** | +26.31% | −12.35% | 45 | 51.1% | 1.20 | 1.25 |
+
+TP1 把胜率从 51.1% 抬到 64.1%，代价是盈亏比 1.20→0.62 —— 赢的那一半仓位被提前兑现，趋势策略的大 R 尾部（3.5×ATR 的 TP）被系统性削掉。**rule_v4 这类趋势策略在半年窗口上是"让利润奔跑"更划算**；`config/strategies/rule_v4.yaml` 仍保持默认 1.0（未改成 `tp1_r=0`），因为单窗口结论不足以定政策，等 paper 观察期跑完再决定。
 
 ### 7.6 净值与账本恒等式
 
@@ -339,6 +400,9 @@ sum(trades.pnl) == final_equity − initial_equity      （容差 ≤1e-3，纯 
 ```
 
 浮盈基准必须是 `avg_entry_price`（加仓后用 `entry_price` 会虚增/虚减浮盈）。
+
+- `include_funding=False` 时公式里的 `funding_since_entry` 恒为 0，等式形式不变
+- TP1 部分止盈会把**一个仓位拆成多笔流水**（`FillReason.TP1` 一条 + 最终全平一条），所以 `total_trades` 大于"开仓次数"；两条流水各自带自己的 `margin_part`，`ret_pct` 的分母是分摊到这一腿的那部分保证金，恒等式照样成立
 
 ### 7.7 绩效指标定义（`_metrics`）
 
@@ -426,7 +490,16 @@ valid = (ts >= f.valid_start) & (ts < f.valid_end - embargo)
 
 ### 9.4 样本外结论（诚实记录）
 
-`lgbm_v1` 在 2026-04-01~10-01 实测 **−23.75%**（136 笔，胜率 44.1%，PF 0.47，DD −24.41%）；`folds.json` 的 `edge_sweep` 与回测一致表明：**当前 38 维特征在 24h 障碍上没有可交易的样本外 edge**。保留该策略用于 paper 观察，不作为主策略。同期 `rule_v4` 在同一口径下 +12.08%，买入持有约 +27%。
+2026-10-07 口径（剔除资金费 + TP1/保本默认开）下 ETHUSDT、100U、`lgbm_v1` 默认参数：
+
+| 窗口 | 收益 | 笔数 | 胜率 | PF | maxDD |
+|---|---|---|---|---|---|
+| 2026-04-01 → 10-01（样本外半年） | **−20.59%** | 189 | 58.7% | 0.54 | −21.28% |
+| 2024-01-01 → 2026-10-01（全历史，首折起点前跳过） | **−22.03%** | 207 | 58.9% | 0.55 | −22.69% |
+
+（旧口径 2026-04→10 是 −23.75% / 136 笔 / 胜率 44.1%，笔数与胜率都受 TP1 拆分影响、收益额受资金费剔除影响，**两列数字不可比**，只能各自做窗口内的相对排序。）
+
+`folds.json` 的 `edge_sweep` 与回测一致表明：**当前 38 维特征在 24h 障碍上没有可交易的样本外 edge**。胜率 58.7% 却仍亏 20%，是因为盈亏比 0.38 —— 赢的小、亏的大，方向命中不等于有正期望。保留该策略在 paper 订阅列表里做**前瞻观察**，不作为主策略。同期 `rule_v4` 在同一口径下 +4.79%（TP1 默认开）/ +12.42%（TP1 关），买入持有约 +27%。
 
 ---
 
@@ -457,9 +530,11 @@ valid = (ts >= f.valid_start) & (ts < f.valid_end - embargo)
 - 像素级校验：隐藏页里 rAF 不跑，需 `setOption({animation:false}) + zr.refreshImmediately()` 才能取到最终帧；强制刷新后阳线 `#27ae60` 5797 px、阴线 `#e74c3c` 6033 px 均正常（未强刷时会误判"红色缺失"）
 - `report.html`：plotly 1 图 4 traces（3000/3000/45/6 点）、4 张表、周期切换按钮 `.tf-tab` 4 个可点，点击后 `#kline-frame` 的 `src` 正确切换且 active 类跟随
 
+上述标记点数量对应 **TP1 关闭口径（45 笔）** 的那次产物；默认口径（TP1 开，64 笔 → 一个仓位可能两条流水）会多出 `tp1` 原因的买卖点，未重复做浏览器校验。`REASON_CN`/`REASON_COLOR` 已覆盖 `FillReason` 的全部取值（含 `tp1`/`liq`，`tests/test_report_metrics.py` 逐枚举断言），所以不会出现"图例里少一项"。
+
 ---
 
-## 11. CLI 手册（`quant`，共 7 个命令）
+## 11. CLI 手册（`quant`：7 个顶层命令 + `paper` 子命令组 3 个）
 
 | 命令 | 作用 | 关键参数 |
 |---|---|---|
@@ -470,8 +545,11 @@ valid = (ts >= f.valid_start) & (ts < f.valid_end - embargo)
 | `train` | walk-forward 训练 `lgbm_v1` 折模型 + 稳定性报告 | `--symbol --data-start --eval-start --eval-end --window-months --step-months --horizon --k-up --k-dn --no-balance --out-dir` |
 | `test-card` | 发送样例入场卡片验证飞书通路 | `--approved/--no-approved` |
 | `dump-card` | 只打印卡片 payload，不发送 | `--approved` |
+| `paper run` | 常驻服务：增量补数据 → 多策略并行推理 → 纸面撮合 → 推卡 | `--symbol --strategy --push/--no-push --pull/--no-pull --log-level` |
+| `paper once` | 只跑一轮就退出（部署后手工验链路） | 同上 |
+| `paper status` | 只读本地库打印每个纸面账户 | `--json` |
 
-`backtest` 选项：`--symbol --start --end --equity --risk-pct --lev --short/--no-short --strategy`；出场 `--sl-atr --tp-atr --time-stop-bars --trail-atr-mult --trail-trigger-r`；金字塔 `--entry-frac --add-frac --add-max --add-trigger-r --no-pyramid`；数据 `--allow-gaps`；策略专属（缺省一律用策略自身默认值，**不在 CLI 写死以免串给别的策略**）`--confirm-bars --srsi-oversold/--srsi-overbought/--srsi-cross-margin --min-signals --adx-min --pullback-atr --tau --model-dir`。
+`backtest` 选项：`--symbol --start --end --equity --risk-pct --lev --short/--no-short --strategy`；出场 `--sl-atr --tp-atr --time-stop-bars --trail-atr-mult --trail-trigger-r`；分批止盈与保本 `--tp1-r --tp1-frac --breakeven-r`（`<=0` 关闭）；`include_funding` **没有 CLI 选项**，只能改 `BacktestConfig` 字段默认值（现为 `False`，即不计资金费；`funding` 帧照旧加载给 ML 特征用）；金字塔 `--entry-frac --add-frac --add-max --add-trigger-r --no-pyramid`；数据 `--allow-gaps`；策略专属（缺省一律用策略自身默认值，**不在 CLI 写死以免串给别的策略**）`--confirm-bars --srsi-oversold/--srsi-overbought/--srsi-cross-margin --min-signals --adx-min --pullback-atr --tau --model-dir`。
 
 执行顺序固定为：`_boot`（配置校验）→ 注册表取策略类 → `build(opts)` → `engine_defaults()` 合并 CLI 显式值 → `required_intervals` 决定加载周期（含 `history_lookback` 前缀）→ 数据闸门 → 引擎 → 报表。
 
@@ -487,22 +565,24 @@ uv run quant backtest --symbol ETHUSDT --strategy rule_v4 --start 2026-04-01 --e
 
 ---
 
-## 12. 测试体系（`uv run pytest -q` → 147 passed，全部离线）
+## 12. 测试体系（`uv run pytest -q` → **213 passed**，全部离线）
 
 | 文件 | 数量 | 覆盖点 |
 |---|---|---|
 | `test_data_layer.py` | 16 | upsert prio 守卫与真实写入条数、回填缺口裁剪、`htf_consistency` 边缘桶剔除、REST `HTTP≥400` 非 dict body、403 不重试、429 按 `retry-after` 休眠、5xx 退避后抛错、`x-mbx-used-weight-1m` 校正预算、`_kline_weight` 分档 |
-| `test_engine_ledger.py` | 16 | SL/TP 同 bar 定序（可配置）、止损 bar 极值 + 中点时间、资金费一次性扣款/空头收/空仓推进/可关闭、`margin=notional/lev`、定仓用 `equity_open`、市价平仓不利滑点、账本恒等式、USD 回撤峰值→谷值、payoff 无亏损时为 inf |
+| `test_engine_ledger.py` | 25 | SL/TP 同 bar 定序（可配置）、止损 bar 极值 + 中点时间、**TP1 分批止盈（含 min_qty 拆不出来只标记）、保本移动、强平 LIQ 触发与成交价**、资金费一次性扣款/空头收/空仓推进/可关闭、`margin=notional/lev`、定仓用 `equity_open`、市价平仓不利滑点、账本恒等式、USD 回撤峰值→谷值、payoff 无亏损时为 inf |
 | `test_engine_pyramid.py` | 15 | 试仓/加仓路径、`add_max_count`、结构突破判定、加仓后 SL 上移、移动止损 |
 | `test_engine_signal_execution.py` | 13 | pending_signal 下一根开盘成交（防前视）、反手、信号平仓、warmup 边界 |
 | `test_features_builder.py` | 13 | 4h/funding 可见性、`hrs_to_funding` 非负、`donchian shift`、缺列报错、hash 稳定、标签 flat 双条件、`sl_first_on_conflict` 一致 |
+| `test_paper_guards.py` | 26 | 持续型否决（行情滞后、日亏 3%、北京日界、每日试仓上限只数当天）、冷却型闸门（回撤 15%、连亏 5 笔、盈利打断连亏、冷却期不重复评估、到期重锚峰值、**冷却跨进程重启存活**）、否决缝合点（闸门拦 open/add 但**永不拦出场**、回测账本没有 veto 钩子、保证金/名义上限、保留原有拒绝理由）、老库 `ALTER` 迁移幂等与 `PAPER_MIGRATIONS` 与 SCHEMA 一致 |
+| `test_paper_runner.py` | 31 | `PaperConfig` 与 `BacktestConfig` 逐字段对齐、`execution_params()` 等价于"裸 backtest"并叠加策略 `engine_defaults`、`risk.yaml` 漂移告警与"策略覆盖不算漂移"、整轮跳过（无本地数据/5m 缺柱/高周期缺柱/无折模型/折加载失败/样本外窗口外）、首轮只观察、实撮轮写库与出卡、演练模式落库即视为已投递、一个仓位多条平仓流水主键不撞、`add_skipped` 不出卡、投递失败同轮重试与 `resend_cooldown_min` 退避、行情滞后只否决不跳轮、断点那根的 pending 信号不被吃掉、更早的 observe 信号不重复撮合、重跑同一轮零新增、**分段跑 == 连续跑**、**paper 与回测逐笔一致（`warmup_bars→0` 对齐起点 + 账本恒等式）**、`seek_funding(None)` 首轮不炸、`_account_due` 只在有新 bar 或数据滞后时进轮、单账户异常不拖垮其余账户、`paper_status` 汇报断点与推送统计 |
 | `test_strategy_build.py` | 5 | `build(opts)` 只认领自家字段、注册表重复名/未知名 |
 | `test_strategy_ml.py` | 16 | 折选择、折外告警且不产信号、`feature_spec_hash` drift guard、冷却、`size_mult` 钳位、`bind_history` 缺失时安全返回 None |
 | `test_strategy_rule_v4.py` | 31 | 状态机转移、4h 仓位倍数、A/B 两个入场口、BROKEN 平仓信号 |
 | `test_train_walkforward.py` | 8 | `plan_folds` 衔接与末折钳位、窗口不足抛错、`fold_masks` 两端 purge 边界（含 `embargo=0` 的反证）、标签编码往返、`edge_from_proba` |
-| `test_report_metrics.py` | 14 | 月度收益含首月、逐月复利等于总收益、月末分桶按北京时间、每个 `FillReason` 都有中文标签与颜色 |
+| `test_report_metrics.py` | 14 | 月度收益含首月、逐月复利等于总收益、月末分桶按北京时间、每个 `FillReason` 都有中文标签与颜色（含 `tp1`/`liq`） |
 
-测试全部用 `httpx.MockTransport` 与内存 SQLite，不触网、不依赖 `data/quant.db`。
+测试全部用 `httpx.MockTransport`、内存 SQLite（`tmp_path` 下的真库文件）与正弦+漂移合成长 K 线，不触网、不依赖 `data/quant.db`、不发飞书（`notifier=None` 走演练分支）。
 
 ---
 
@@ -573,7 +653,7 @@ uv run quant backtest --symbol ETHUSDT --strategy rule_v4 --start 2026-04-01 --e
 
 修复前 **5/9 违反**（最大 406.79 USDT，且那一 run 的 `--equity` 默认还是 10000），修复后 **0/11 违反**，残差仅为 CSV 保留 4 位小数带来的舍入。
 
-### 13.3 回归证据：修复前后指标（**不可比**）
+### 13.3 回归证据：修复前后指标（**不可比**，且"修复后"列已被第 2 轮口径取代，仅作历史留档 → 现行数字见 §16）
 
 | run（100U 起，除注明） | 修复前 收益 / 笔数 / TP 笔数 | 修复后 收益 / 笔数 / TP 笔数 |
 |---|---|---|
@@ -595,34 +675,203 @@ uv run quant backtest --symbol ETHUSDT --strategy rule_v4 --start 2026-04-01 --e
 
 结论：**当前报表数字是保守口径下的可信结果；历史文档（含 `docs/rule_v4-trend-design.md`、`config/strategies/lgbm_v1.yaml` 旧注释）里的绝对数字均属修复前口径，只能用于相对排序，不能与新数字直接对比。**
 
+### 13.4 本轮（paper 服务 + TP1/保本/强平/闸门 + 资金费剔除）新增的改动与缺陷
+
+**功能落地**（原本只存在于设计文档）：
+- TP1 分批止盈 + 保本移动 + 强平 `FillReason.LIQ` 触发，全部写进共用执行层 `backtest/position.py`，回测与 paper 同序（§7.5b）
+- `caps.*` / `guard.*` 的 `[paper]` 闸门从"只告警"改为**拦截新开仓**（用户明确要求），实现为 `ledger.approve_fn` 缝合点（§15.5）。回测端该钩子恒为 `None`，所以回测成交序列与加闸门之前**逐位相同**
+- 成本模型剔除资金费（`include_funding` 默认 `False`），数据仍加载供 ML 特征使用（§7.5）
+
+**新发现的 3 个真实缺陷**（都不是测试写错，是实现 bug；每个都配了回归用例）：
+
+| # | 症状 | 根因与修法 | 暴露途径 |
+|---|---|---|---|
+| 1 | `TypeError: precompute() got an unexpected keyword argument 'swing_lookback'` | `paper/runner.py` 调用 `precompute` 时把配置字段名当参数名传了 → 改为 `swing_window=max(2, int(cfg.swing_lookback))` | 首轮真跑 paper（**有数据就必炸**，之前的单测没覆盖到真实调用） |
+| 2 | 重启后可能把上一轮已成交的信号晚一根 bar 重复开仓 | `BarPipeline.on_bar(mode="observe")` 原先只在策略返回非 None 时覆盖 `pending`，历史信号会残留在游标里 → 改为**无条件覆盖**（含 None）：只有断点那根 bar 的信号还没被撮合过，留着它才能在重启后第一根 live bar 成交 | 设计重启等价用例时发现 |
+| 3 | `TypeError: '<' not supported between instances of 'NoneType' and 'NoneType'` | `seek_funding(None)`（首轮没有断点）把 `None` 喂给 `np.searchsorted` → 加 `t_ms is None` 短路，指针归 0 | 本机真跑 `paper once`（`include_funding=False` 后 funding 帧仍非空，所以照样触发） |
+
+缺陷 2 的两条方向都有测试钉住（`test_pending_signal_at_breakpoint_is_not_eaten` / `test_signal_from_an_earlier_observed_bar_is_not_re_executed`）—— 只写其中一条都会让这个改动"看起来对"。
+
+**测试侧的一处口径纠正**：`tests/test_paper_guards.py` 的迁移用例原先手工拼 `INSERT` 行，漏了 `paper_accounts` 的 NOT NULL 列而报 `IntegrityError`；改为走 `PaperState.commit()` 生产路径写入，顺带证明了 `ALTER` 迁移的幂等性。
+
+**本轮改动后 `ruff check --select F,E9 src tests` clean，`pytest -q` 213 passed。**
+
 ---
 
 ## 14. 已知限制（明确记录，不掩饰）
 
-1. **定仓价与成交价近似**：`margin`/`notional` 用 `signal.price_ref`（bar.close）计算，实际成交在下一根 bar.open ± 滑点，误差约 ±2bps 量级；`stop_loss` 已改用真实成交价重算，故只有仓位量带此近似
-2. **不模拟强平**：`FillReason.LIQ`、`Position.tp1_done/breakeven_done/extreme_price/realized_pnl` 等为预留字段，引擎不触发强平；10× 下强平约在 −7.45% 价格，而 SL 设在 1.5~2.0×ATR（远更近），常规路径不会走到
-3. **无 TP1 分批止盈 / 保本移动**：TP 命中即全平；`risk.yaml` 里对应键已注释说明未实现
-4. **成交时间戳**：入场/信号平仓记在 bar 收盘，止损/止盈记 bar 中点 —— 逐笔时长与真实 tick 路径有差异（1m/秒级路径数据未回填，`backtest.intra_bar_path=exact_1m` 是未来开关）
-5. **只有 REST、只有 ETHUSDT**：无 WebSocket、无 1m；BTCUSDT 在 `symbols.yaml` 中 `enabled=false` 且未回填
+1. **定仓价与成交价近似**：`margin`/`notional` 用 `signal.price_ref`（bar.close）计算，实际成交在下一根 bar.open ± 滑点，误差约 ±2bps 量级；`stop_loss`/`tp_price` 已改用真实成交价重算，故只有仓位量带此近似
+2. **强平价只在试仓时估算，加仓不重算**：`FillReason.LIQ` 已会触发平仓，但 `Position.liq_price` 来自首腿的 `est_liq_price`，加仓后加权均价抬高、真实强平价会更靠近均价而账面仍用旧值 → 对多头加仓单偏乐观（更晚才判强平）。10× 下 SL 设在 1.5~2.0×ATR（远更近），常规路径不会走到强平，所以影响面小；`Position.realized_pnl`、`extreme_price` 仍是预留字段
+3. **TP1 的默认值未经多窗口验证**：默认 `tp1_r=1.0 / tp1_close_frac=0.5 / breakeven_after_r=1.0`，而 rule_v4 半年窗口实测 TP1 关闭更好（§7.5b）。当前只在单一窗口上对比过，政策未定，`config/strategies/rule_v4.yaml` 仍保持默认
+4. **成交时间戳**：入场/信号平仓记在 bar 收盘，止损/止盈/TP1/强平记 bar 中点 —— 逐笔时长与真实 tick 路径有差异（1m/秒级路径数据未回填，`backtest.intra_bar_path=exact_1m` 是未来开关）
+5. **只有 REST、只有 ETHUSDT**：无 WebSocket、无 1m；BTCUSDT 在 `symbols.yaml` 中 `enabled=false` 且未回填。`quant backtest` 一次仍只跑一个 `--strategy`（多策略并行只在 paper 服务里）
 6. **维持保证金率取最高档**：缺签名接口 `leverageBracket`，属安全侧偏差（仓位偏小）
-7. **单策略单品种回测**：`backtest` 一次只跑一个 `--strategy`；多策略并行是 paper 服务的需求（§15）
-8. **`models/` 未纳入 gitignore**：9.0 MB 折模型会被 `git add` 带进仓库，提交前需确认
-9. **K 线由 5m 聚合**：15m/1h/4h/1d 图与指标读的是交易所 1h/4h 值；`check-data` 的 `htf_consistency` 会显式报出偏差（当前实测偏差为 0），两者不一致时以交易所值为准并在报表标注
-10. **`guard`/`caps` 的风控闸门只在设计上存在**：回测不启用，paper 服务必须自己实现
+7. **K 线由 5m 聚合**：15m/1h/4h/1d 图与指标读的是交易所 1h/4h 值；`check-data` 的 `htf_consistency` 会显式报出偏差（当前实测偏差为 0），两者不一致时以交易所值为准并在报表标注
+8. **paper 闸门与回测刻意不一致**：`caps.*`/`guard.*` 只拦 paper 的新开仓，回测不启用。所以**纸面账户的收益率不会等于同参数回测** —— 一致的是"给定同一串信号与同一份配置，撮合序列逐位相同"（`TestBacktestParity`），不是"闸门效果"
+9. **paper 不做跨策略仓位合并**：每个 `(symbol, strategy)` 各读各的 100U 纸面账户，同品种两策略同时持仓时真实账户会共用保证金，纸面不会（用户明确"先不管"）
+10. **`models/` 未纳入 gitignore**：9.0 MB 折模型会被 `git add` 带进仓库，提交前需用户确认（commit / ignore 二选一，尚未决定）
+11. **ML 策略需要续训才能进 paper**：`_model_readiness` 要求当前时刻落在某折 `[test_start, test_end)` 内，本机实测 `lgbm_v1` 已超出末折（2026-10 之后）→ 每轮只推"需 quant train 续训"告警，不产信号
 
 ---
 
-## 15. 下一步：模拟交易 / 信号推送服务（未实现，接口已预留）
+## 15. 模拟交易 / 信号推送服务（`src/quant/paper/`，已实现）
 
-需求（用户原话口径）：服务器上以 shell 脚本启动，多策略并行运行策略执行与飞书信号推送；真实下单由用户手动完成；暂不处理多策略仓位共存。
+需求（用户原话口径）：服务器上以 shell 脚本启动，多策略并行运行策略执行与飞书信号推送；**真实下单由用户手动完成**（系统只产信号，不接下单 API）；暂不处理多策略仓位共存。
 
-已具备的地基：`contracts.Signal/FillReason/Position`、`BaseStrategy`（`Mode.LIVE` 已在契约里）、`MarketDataService`（只读、无副作用）、`FeishuNotifier + build_card`、`sizing.compute_risk_size`（拒绝原因可直接进卡片）、`risk.yaml` 的 `[paper]` 键（`caps.*`、`guard.*`）。
+### 15.1 进程形态与节拍
 
-待落地（设计已在 `docs/lgbm-strategy-and-paper-trading-design.md`）：
-1. `src/quant/paper/`：复用 `backtest/position.py` 的持仓对象，模拟账本 + 检查点；Store 新增表 `paper_accounts / paper_positions / paper_signals / paper_checkpoints`，`signal_id` 幂等去重
-2. CLI `quant paper run|once|status`（多策略 = 多个独立账户并行，各自 `strategy + symbol`）
-3. `scripts/paper.sh`：`start/stop/restart/status/once/logs`，进程内 Binance 走代理、飞书直连；配套 `deploy/paper-trading.service`
-4. 实跑验证：至少一次 `once` 出卡 + 一次 `run` 跨 1h 收盘周期
+单进程多账户（`quant paper run`）。理由：REST 权重预算多进程会重复扣、SQLite 单写者更安全、飞书 40/min 限流只有单进程才真正生效。
+
+```
+每 poll_sec=20s 一轮（PaperService.run_cycle）
+  1. now_ms() 用交易所时间（client.now_ms()），本地时钟只做日志
+  2. _pull：期望的最新已收盘 bar = floor(now − resync_grace_ms − step)
+     水位线没追到才增量回填 spec/5m/1h/4h + funding（追到了不占配额）
+  3. 逐账户判 _account_due，只对"有新 bar 或数据滞后"的账户跑 run_round
+  4. 任一账户抛异常 → 该轮记 `skipped=执行异常：…`，主循环继续（服务停摆比少推一条信号贵得多）
+  5. SIGTERM/SIGINT → 置 `_stop`，当前轮跑完再退；`_sleep` 分段睡，TERM 后最多 1s 醒
+```
+
+`_account_due` 的两条准入：`watermark > checkpoint`（有新 bar），或 `now − (watermark+step) > stale_data_max_gap_min×60_000 + step`（数据滞后）。第二条是必须的 —— 不然行情断了的时候 stale 闸门永远得不到评估、也就永远不会有"行情滞后"告警。5m 周期的阈值 = 5 min + 5 min = **10 分钟**（测试里用 +20 min 才进轮，留的是余量）。首轮没有断点则无条件进轮。
+
+### 15.2 一轮的口径（`PaperRunner.run_round`）
+
+```
+observe_start = checkpoint − replay_days(7d)      # 首轮没有断点就用最新收盘 bar 为基准
+load_start    = observe_start − warmup_bars()×step − strategy.history_lookback()
+① 数据闸门：对 strategy.required_intervals 逐个 assert_complete(grid, floor(start), floor(watermark+step))
+   任一周期 coverage < 1.0 → 整轮跳过 + 告警（残缺窗口里的指标与 bar 间距都不可信）
+② 模型闸门（ML 策略）：折能加载 且 ref_ms 落在某折 [test_start, test_end) 内，否则跳过并告警
+③ precompute / precompute_htf → HtfCursor；bind_history + strategy.reset()
+④ ledger.seek_funding(checkpoint + step)          # 窗口每轮滑动，落库存数组下标没有意义
+⑤ guards.refresh(now, data_gap)                   # 本轮否决理由 + 冷却到期 + 告警
+⑥ 逐根 bar：ts_open < observe_start 只做指标预热
+             to_ms(bar.ts_close) > now → break     # 交易所未收盘的 bar 绝不能出信号
+             ts_open <= checkpoint → mode="observe"（只调策略，账本一行不写）
+             否则            → mode="live"（与回测同一个 BarPipeline）
+⑦ 事件 → paper_signals / paper_trades 行，state.commit() 一次事务落库
+⑧ 先落库再推送（_deliver），然后补发历史失败（_resend_unsent）
+```
+
+- **observe 重放**取代了设计里的"只喂新 bar"：策略的隐藏状态（rule_v4 的 1h 趋势状态机、冷却计数、ML 特征帧）必须与断点对齐，而每轮都从 `reset()` 开始，所以"跑第 1 轮"与"重启第 100 轮"完全等价。observe 区间 `replay_days=7` 天。
+- **落库先于推送**：崩溃只会留下 `sent_ok=0` 的行等下一轮补发，不会出现"卡片发了、账本没记"的幽灵成交。
+- 模型可用性**不用 `dataset_version` 做闸门**：paper 每轮都在增量拉数据，版本串必然变化，拿它当闸门等于永远拒绝服务。特征漂移由 `feature_spec_hash` 断言拦住，"模型过期"由折窗口拦住。
+
+### 15.3 纸面撮合与回测同源（关键设计约束）
+
+`PaperConfig` 字段名与默认值必须和 `BacktestConfig` 完全一致（只有 `start`/`end` 换成断点），`execution_params()` = 字段默认值 + 策略 `engine_defaults()` + `risk.account.initial_equity_usdt`，口径等于"不带任何开关的 `quant backtest`"。执行层是同一个 `BarPipeline`/`PositionLedger`，`precompute` 也是同一份。
+
+由 `tests/test_paper_runner.py` 双重钉住：字段逐一对齐断言 + **把 `warmup_bars` 打到 0 让两条链路从同一根 bar 开始 live，逐笔比对 `trade_id` 序列、净值点，并校验 `equity − 100 == sum(pnl)`**。
+
+唯一的差异是 paper 多挂了 `ledger.approve_fn`（回测端为 `None`）。
+
+### 15.4 持久化（`data/store.py`，5 张表）
+
+| 表 | 主键 | 作用 |
+|---|---|---|
+| `paper_accounts` | `(symbol, strategy)` | 现金/净值/`equity_open`/`peak_equity`（回撤闸门的高水位）/`pause_until_ms`（冷却到期）/`bars_since_entry`/`funding_ptr`/加仓计数 |
+| `paper_positions` | `position_id` | 持仓全量还原字段：`avg_entry_price`、`stop_loss`、`base_stop_price`、`tp_price`、`liq_price`、`add_levels_json`、`trailing_*`、`tp1_done`、`breakeven_done`、`entry_fee_outstanding`、`signal_id` |
+| `paper_signals` | `signal_id` | 卡片审计 + 待投递队列（`sent_ok`/`sent_at_ms`/`payload_json`）+ 闸门告警 + 日计数 |
+| `paper_trades` | `trade_id` | 逐笔平仓流水，`paper_status` 的已实现盈亏与连亏笔数都从这里算 |
+| `paper_checkpoints` | `(symbol, strategy)` | 断点 `last_processed_ts_ms` + `dataset_version` |
+
+**确定性主键**（重启幂等全靠它，`paper/state.py`）：
+
+| 行 | id 形式 | 幂等效果 |
+|---|---|---|
+| 信号 / 事件 | `{symbol}:{strategy}:{signal_id}:{kind}` | 同一笔信号重启后 `INSERT OR IGNORE` 撞主键，不推第二次 |
+| 平仓卡片 | `{symbol}:{strategy}:{position_id}:{reason}:{exit_time_ms}` | 一个仓位的 TP1 部分止盈 + 全平是**两条**流水（少了 `reason:exit_time` 就会互相撞掉、少推一张卡） |
+| 告警 | `{symbol}:{strategy}:alert:{tag}`，tag 带 `day_start_ms` 或触发时刻 | 同一闸门同一自然日只推一张 |
+| 交易 | `{position_id}:{reason}:{exit_time_ms}` | 同上 |
+
+`paper_accounts` 的两列（`peak_equity`、`pause_until_ms`）通过 `PAPER_MIGRATIONS` + `ALTER TABLE` 给老库补上，重复打开同一库不报错（测试用真实生产写入路径验证幂等）。
+
+### 15.5 `[paper]` 风控闸门：只拦新开仓，绝不强平已有持仓
+
+`EntryGuards.refresh()` 每轮评估一次，`vetoes()` 在撮合前给 `RiskDecision` 追加拒绝理由（`veto()` 在 frozen dataclass 上重建，保留原有 `reject_reasons`）。被拦的动作只有 `OPEN_LONG/OPEN_SHORT/ADD_TO_LONG/ADD_TO_SHORT`；出场（SL/TP/TP1/LIQ/时间止损）一律由执行层决定，与回测逐位一致 —— **否则纸面数字失去参考价值**。
+
+| 闸门 | 阈值（`risk.yaml`） | 类型 | 触发后 |
+|---|---|---|---|
+| 行情滞后 | `guard.stale_data_max_gap_min=5` | 持续型 | 本轮不再试仓 + 告警（tag 带北京日界，每日一张） |
+| 日亏停 | `daily_loss_stop_pct=0.03` | 持续型 | 当日已实现 ≤ −3%×当日期初净值 → 停止试仓（期初净值由 `equity − 当日已实现` 回推） |
+| 每日试仓上限 | `max_new_entries_per_day=4` | 持续型 | 只数**当天** `kind=open` 的信号（北京日界 `day_start_ms`） |
+| 回撤暂停 | `max_drawdown_pause_pct=0.15` | 冷却型 | 相对 `peak_equity` 回撤 15% → 写 `pause_until_ms = now + cooldown_hours(24h)` + 告警 |
+| 连亏冷却 | `max_consecutive_losses=5` | 冷却型 | 最近 5 笔全亏 → 同样 24h 冷却；一笔盈利即清零 |
+| 单品种保证金占比 | `max_margin_per_symbol_pct=0.30` | 逐笔 | `已占用 margin + 本笔 margin > 30%×净值` → 否决本笔 |
+| 单笔名义上限 | `max_notional_usdt=5000` | 逐笔 | 超限否决 |
+
+三条实现细节（都有测试）：
+- **冷却中不再评估其余闸门**：连亏笔数在下一笔盈利之前会一直成立，每轮重触发会让冷却期永远走不完。
+- **冷却到期把 `peak_equity` 重锚到当前净值**，否则恢复的第一轮会被回撤闸门再触发一次（死循环）。
+- 闸门状态一律从 SQLite 读，进程重启不会把"今天已经亏了 3%"忘掉。
+
+被拦下的信号仍会出卡片，但 `kind=reject`、`note` 里逐条写明拒绝理由 —— 用户要看到的是"策略想开但被风控拦了"，而不是静默消失。
+
+### 15.6 卡片矩阵（`notify/cards.py`）
+
+| `kind` | 卡片 | 触发 | 备注 |
+|---|---|---|---|
+| `open` | `build_card(signal, decision)` | 试仓 | 方向/价格/qty/SL/TP/杠杆/保证金/置信度/理由，北京时间（UTC+8） |
+| `add` | 同上 | 金字塔加仓 | |
+| `close` | `build_close_card(trade, ...)` | 全平或 TP1 部分止盈（`partial` 事件也映射成 `close`） | 含 `pnl` / `ret_pct` / 平仓原因中文标签 `exit_label` |
+| `reject` | `build_card`（`approved=False`） | 定仓被拒或被闸门否决 | 卡片正文列出拒绝理由 |
+| `alert` | `build_alert_card(title, text, ...)` | 数据缺口 / 模型不可用 / 行情滞后 / 回撤或连亏冷却 | 主键去重，同 tag 同一天只一张 |
+
+`add_skipped` 事件**不出卡**（只计数）：金字塔条件不满足时每根 bar 都会产生一条，推出去就是把用户的消息流变成日志流。
+
+飞书失败：`FeishuBusy/FeishuError` 与其它异常都被吞成 `sent_ok=0` 并 WARNING/ERROR，绝不让卡片投递拖垮主循环；补发按 `notify.feishu.resend_cooldown_min=10` 退避（`paper_signals_unsent(..., attempt_before_ms=now−cooldown)`），设为 0 时同一轮就会重试。演练模式（`--no-push`，`notifier=None`）下 `_send` 直接返回 True，落库即视为已处理，不进补发队列。
+
+### 15.7 部署与实跑验证
+
+`scripts/paper.sh start|stop|restart|status|once|logs`：预检 `.env` 存在、`FEISHU_WEBHOOK_URL` **是否定义**（绝不打印值）、代理配置；优先用 `.venv/bin/quant`，否则 `uv run quant`；PID 写 `run/paper.pid`（`running_pid()` 用 `ps -o command=` 校验，防 PID 复用）；`stop` = TERM → 最多等 30s → 才 KILL。环境变量开关 `PAPER_SYMBOL/PAPER_STRATEGY/PAPER_NO_PUSH/PAPER_NO_PULL`。
+
+`deploy/paper-trading.service`：`KillSignal=SIGTERM` + `TimeoutStopSec=60`、`Restart=always/RestartSec=10`、`PYTHONUNBUFFERED=1`、`EnvironmentFile=-…/.env`、`ReadWritePaths=data logs`、`NoNewPrivileges/PrivateTmp/ProtectSystem=full`。**故意没有 `WatchdogSec`**：进程不发 `sd_notify`，加了会被 systemd 定期误杀。
+
+本机实测（**全程 `--no-push`，没有向飞书群发过任何一条真实消息**）：
+- `paper once --no-pull`：1h/4h 数据只到 2026-10-02 而 5m 到 14:10 → 两个账户都整轮跳过并各写一条 gap 告警（`1h 缺 5/168 根（首个缺失 2026-10-02T09:00）；4h 缺 1/42 根`）。这是**设计行为**：高周期缺柱会让 `HtfCursor` 错位。
+- `backfill` 补齐后 `paper once --no-pull`（rule_v4）：`观察 2016 根 / 实撮 0 根，事件 0 条，净值 100.00，空仓，闸门 放行`，checkpoint 落后 0 根。首轮只 observe 是预期的（断点为空 → 全部进 observe 区间）。
+- `lgbm_v1`：`模型不可用，本轮跳过 —— 当前时刻超出最后一折的样本外窗口，需 quant train 续训`（折模型 eval 到 2026-10-01 为止）。
+- `start` → `status` → `stop`：PID 正常，TERM 后日志给出"收到信号 15，当前轮结束后退出"，优雅退出。
+- 库里现存 1 行 `paper_accounts`（`rule_v4`，净值 100）、1 行 `paper_checkpoints`、4 行 `paper_signals`（全是 alert）、0 行 `paper_trades`。
+
+### 15.8 成本口径复述（用户 2026-10-07 决定）
+
+10× 杠杆下往返 taker = 名义 × 0.1% = **保证金的 1%**（单边万 5 × 2，除以杠杆 10），加双边 2bp 不利滑点后约 **1.4%**；资金费按实测均值约 **0.24%/3 天**。因此成本模型只保留手续费 + 滑点，`include_funding=False`（§7.5）。这条口径同时决定了回测与 paper 的净值曲线，卡片上的保证金/数量也都是这个口径。
+
+---
+
+## 16. 现行回归基线（2026-10-07 第 2 轮口径）
+
+统一条件：ETHUSDT，`--equity 100`，10×，全 taker 0.05% + 2bp 不利滑点，**不计资金费**，TP1/保本默认开（`tp1_r=1.0 / frac=0.5 / breakeven=1.0`），保守口径（SL 用 bar 极值 + 中点时间、双触发取 SL）。原始输出留在 `logs/rebaseline/*.log`（gitignore）。
+
+| 策略 | 窗口 | 收益 | CAGR | maxDD | 笔数 | 胜率 | 盈亏比 | PF |
+|---|---|---|---|---|---|---|---|---|
+| rule_v1 | 2024-01→2026-10 | −80.10% | −44.39% | −80.15% | 664 | 41.9% | 0.31 | 0.22 |
+| rule_v1 | 2026-04→2026-10 | −42.28% | −66.59% | −42.74% | 249 | 35.3% | 0.34 | 0.18 |
+| rule_v2 | 2024-01→2026-10 | −13.53% | −5.15% | −13.70% | 36 | 16.7% | 0.22 | 0.04 |
+| rule_v2 | 2026-04→2026-10 | −1.65% | −3.26% | −1.81% | 4 | 0.0% | 0.00 | 0.00 |
+| rule_v3 | 2024-01→2026-10 | −80.05% | −44.34% | −80.07% | 750 | 39.5% | 0.30 | 0.20 |
+| rule_v3 | 2026-04→2026-10 | −80.13% | −96.02% | −80.27% | 763 | 35.1% | 0.27 | 0.14 |
+| **rule_v4** | 2024-01→2026-10 | **−53.55%** | −24.33% | −60.71% | 511 | 62.6% | 0.48 | 0.80 |
+| **rule_v4** | 2026-04→2026-10 | **+4.79%** | +9.77% | −12.44% | 64 | 64.1% | 0.62 | **1.10** |
+| rule_v4（TP1 关） | 2026-04→2026-10 | +12.42% | +26.31% | −12.35% | 45 | 51.1% | 1.20 | 1.25 |
+| lgbm_v1 | 2024-01→2026-10 | −22.03% | −8.65% | −22.69% | 207 | 58.9% | 0.38 | 0.55 |
+| lgbm_v1 | 2026-04→2026-10 | −20.59% | −36.86% | −21.28% | 189 | 58.7% | 0.38 | 0.54 |
+
+对照：同一半年窗口买入持有约 **+27%**。
+
+账本恒等式 `sum(trades.pnl) == final − initial` 在以上每个 run 都成立（残差 ≤1e-3，纯 CSV 4 位小数舍入）；`tests/test_engine_ledger.py` 与 `test_paper_runner.py` 各有一份断言。
+
+诚实结论：
+1. **rule_v4 的半年正收益不稳健**。全历史 −53.55%、逐笔期望为负（PF 0.80），半年 +4.79% 只说明它恰好适应这段上行趋势；"周 10%"的原始目标在任何参数组合下都不可达（见记忆 `project-rule-v4-result`，本轮数字已按第 2 轮口径更正）。
+2. **TP1 是净值的减分项而不是加分项**（趋势策略）：胜率从 51.1% 抬到 64.1% 看着好看，盈亏比 1.20→0.62 把大 R 尾部削掉了。默认值暂未调整（§14 第 3 条）。
+3. **资金费剔除的实际影响很小**：rule_v4 半年、同样关闭 TP1/保本的口径下，计资金费 +12.08% → 不计 +12.42%，**笔数都是 45**（说明这个窗口里新增的保本/强平触发没有改变成交序列），差额约 0.34pp 就是持仓期资金费 —— 与"量级太小、只会引入无关变量"的判断一致。
+4. `lgbm_v1` 全样本外负收益，维持"只留 paper 观察"的处置。
+5. **本节是唯一现行基线**。其余文档里的头条数字（`rule_v4-trend-design.md` 的 +18.98%、
+   `ml-regime-gate-design.md` / `multimodal-kline-strategy-design.md` 的 −63.93%、
+   `lgbm-strategy-and-paper-trading-design.md` §11.4 的 τ 扫描）属第 0/1 轮口径，各文档开头已加
+   口径注记并把本节链过去；那些实验是在旧口径下跑的，重跑会让当时的表格与自身结论脱节，
+   所以保留原值 + 标注，不做覆盖式改写。
 
 ---
 
@@ -640,10 +889,16 @@ uv sync                                     # 复用 .venv
 uv run quant backfill --symbol ETHUSDT      # 断点续传，需代理
 uv run quant check-data --symbol ETHUSDT    # 回测前必跑
 uv run quant backtest --strategy rule_v4 --start 2026-04-01 --end 2026-10-01
+uv run quant backtest --strategy rule_v4 --tp1-r 0 --breakeven-r 0     # 关闭分批止盈/保本
 uv run quant train --symbol ETHUSDT --eval-start 2026-04-01 --eval-end 2026-10-01
 uv run quant dump-card                      # 只看卡片
 uv run quant test-card                      # 真发飞书（需 .env）
 uv run pytest -q && uv run ruff check --select F,E9 src tests
+
+# paper 服务（先 --no-push 演练，确认链路后再真发）
+uv run quant paper once  --strategy rule_v4 --no-push --no-pull
+uv run quant paper status [--json]
+./scripts/paper.sh start|status|stop|logs   # PID 在 run/paper.pid，日志 logs/paper.out
 ```
 
 ## 附录 C：指标口径速查
