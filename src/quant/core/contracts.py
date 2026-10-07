@@ -162,6 +162,9 @@ class Position:
     bars_held: int = 0
     tp1_done: bool = False
     breakeven_done: bool = False
+    # 尚未结算进逐笔盈亏的开仓腿手续费：分批止盈后剩余仓位只背对自己那一份，
+    # 否则全平时会把已经记过的开仓费再扣一次，sum(pnl) 与净值增长就会差一口气
+    entry_fee_outstanding: float = 0.0
     extreme_price: float | None = None
     status: Literal["open", "closed"] = "open"
     # ---- 金字塔加仓扩展字段 ----

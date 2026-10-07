@@ -8,8 +8,11 @@ symbols:
     since: "2024-01-01"
     contract: usdm_perp
     leverage_default: 10
-    strategies: [rule_v1]
-  # 新增品种照此复制即可（BTCUSDT/SOLUSDT ...）
+    # paper 服务的订阅列表（回测用 --strategy 指定，不读这里）。
+    # rule_v4 是实测最好的规则策略；lgbm_v1 样本外为负收益，留在这里是为了持续观察
+    # paper 表现是否与回测一致，见 config/strategies/lgbm_v1.yaml 的结论段。
+    strategies: [rule_v4, lgbm_v1]
+  # 新增品种照此复制即可（SOLUSDT ...）
   BTCUSDT:
     enabled: false
     base_interval: 5m

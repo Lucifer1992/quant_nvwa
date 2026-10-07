@@ -6,4 +6,6 @@ feishu:
   secret_env: FEISHU_SECRET
   max_per_min: 40
   min_interval_sec: 0.25
-  dedup_ttl_min: 30
+  # paper 服务补发的最小间隔：一条卡片投递失败后隔这么久再试一次，
+  # 避免飞书持续故障时每 20 秒重推一遍历史消息把限流配额吃光
+  resend_cooldown_min: 10

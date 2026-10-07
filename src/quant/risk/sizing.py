@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from decimal import ROUND_DOWN, Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from ..core.contracts import RiskDecision, Signal, SymbolSpec
 
 
-def _floor_to(value: float, step: float) -> float:
+def floor_to(value: float, step: float) -> float:
     if step <= 0:
         return value
     return float(Decimal(str(value)).quantize(Decimal(str(step)), rounding=ROUND_DOWN))
@@ -57,13 +57,13 @@ def compute_risk_size(
         qty = (equity * risk_pct) / stop_dist
 
     step = float(symbol_spec.step_size)
-    qty = _floor_to(qty, step)
+    qty = floor_to(qty, step)
 
     # 名义敞口不得超过固定杠杆下的可用本金
     max_notional = equity * global_max_leverage
     notional = qty * signal.price_ref
     if notional > max_notional:
-        qty = _floor_to(max_notional / signal.price_ref, step)
+        qty = floor_to(max_notional / signal.price_ref, step)
         notional = qty * signal.price_ref
 
     if qty < float(symbol_spec.min_qty):
@@ -110,3 +110,41 @@ def estimate_liq_price(
         return entry_price * (1 - 1.0 / leverage + maint_margin_rate + taker_fee_rate)
     else:
         return entry_price * (1 + 1.0 / leverage - maint_margin_rate - taker_fee_rate)
+
+
+def decide_position(
+    *,
+    signal: Signal,
+    equity: float,
+    atr: float,
+    cfg: Any,
+    spec: SymbolSpec,
+    size_mult: float = 1.0,
+    is_add: bool = False,
+) -> RiskDecision:
+    """把一条开/加仓信号换算成 RiskDecision，仓位比例取自 cfg 的金字塔政策。
+
+    回测与 paper 都只走这里，避免"卡片上的数量"与"账本里的数量"来自两份代码。
+    cfg 需具备：risk_pct / sl_atr_mult / global_max_leverage / taker_fee /
+    pyramid_enabled / entry_frac / add_frac。
+
+    `size_mult` 钳在 [0.2, 1.0]：策略可按高周期背景减仓，但不允许超额下注。
+    """
+    size_mult = min(max(float(signal.meta.get("size_mult", size_mult)), 0.2), 1.0)
+    want_add = is_add and bool(cfg.pyramid_enabled)
+    frac = cfg.add_frac if want_add else cfg.entry_frac
+    target_qty = 0.0
+    if cfg.pyramid_enabled:
+        target_qty = equity * frac * size_mult * cfg.global_max_leverage / signal.price_ref
+    return compute_risk_size(
+        signal=signal,
+        decision=RiskDecision(signal=signal, approved=False),
+        equity=equity,
+        risk_pct=cfg.risk_pct,
+        atr=atr,
+        sl_atr_mult=cfg.sl_atr_mult,
+        global_max_leverage=cfg.global_max_leverage,
+        symbol_spec=spec,
+        taker_fee_rate=cfg.taker_fee,
+        qty=target_qty,
+    )

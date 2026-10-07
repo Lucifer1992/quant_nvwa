@@ -1,0 +1,40 @@
+# 模拟交易/信号推送服务的 systemd 单元模板（服务器上二选一：本文件或 scripts/paper.sh）。
+#
+#   sudo cp deploy/paper-trading.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   systemctl start paper-trading && systemctl status paper-trading
+#   journalctl -u paper-trading -f
+#
+# 安装前需要替换的占位符：User、WorkingDirectory、ExecStart 里的路径。
+# 用 systemd 而不是 shell 后台进程的价值：开机自启、崩溃自动重启、日志进 journal。
+[Unit]
+Description=Quant paper trading & signal push service
+Documentation=file://REPO_ROOT/docs/lgbm-strategy-and-paper-trading-design.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=USERNAME
+WorkingDirectory=/PATH/TO/Quant_LLM
+# 直接调 .venv 里的入口：systemd 不做 shell 展开，也不能依赖 uv 在缺失时静默新建环境
+ExecStart=/PATH/TO/Quant_LLM/.venv/bin/quant paper run
+# 服务收 TERM 会在当前轮结束后退出（落库先于推送），给足收尾时间再 SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=always
+RestartSec=10
+# 5m 一轮，异常退出由 Restart 兜住；不写 WatchdogSec —— 进程没接 sd_notify，写了会被定期杀掉
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/PATH/TO/Quant_LLM/.env
+StandardOutput=journal
+StandardError=journal
+
+# 只给它读写自己目录的权限：这个进程持有飞书 webhook，越少接触越好
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/PATH/TO/Quant_LLM/data /PATH/TO/Quant_LLM/logs
+
+[Install]
+WantedBy=multi-user.target

@@ -15,10 +15,14 @@ from .infra.log import setup
 from .infra.settings import Settings, get_settings, validate_config
 from .notify.cards import build_card, sample_signal_decision
 from .notify.feishu import FeishuConfig, FeishuNotifier
+from .paper import PaperService
+from .paper.service import paper_status
 from .risk.exchange_meta import parse_symbol_spec
 from .strategy import get_strategy, list_strategies as registered_strategies
 
 app = typer.Typer(add_completion=False, help="Quant LLM MVP CLI")
+paper_app = typer.Typer(add_completion=False, help="模拟交易信号服务（纸面账户，不真实下单）")
+app.add_typer(paper_app, name="paper")
 
 
 def _boot(level: str | None) -> Settings:
@@ -222,6 +226,10 @@ def run_backtest(
     # 出场节奏（不传则按策略的 engine_defaults）
     time_stop_bars: int | None = typer.Option(None, "--time-stop-bars", help="时间止损（5m bar 数；5m 策略默认 96=8h，rule_v4 默认 864=3天）"),
     trail_atr_mult: float | None = typer.Option(None, "--trail-atr-mult", help="移动止损跟随距离（× entry_atr，默认 1.0，rule_v4 1.5）"),
+    # 分批止盈 / 保本（不传则用 BacktestConfig 字段默认值：1R 平一半 + 止损移到开仓价）
+    tp1_r: float | None = typer.Option(None, "--tp1-r", help="到几个 R 分批止盈（<=0 关闭，默认 1.0）"),
+    tp1_close_frac: float | None = typer.Option(None, "--tp1-frac", help="分批止盈平掉的持仓比例（默认 0.5）"),
+    breakeven_after_r: float | None = typer.Option(None, "--breakeven-r", help="浮盈到几个 R 把止损移到开仓价（<=0 关闭，默认 1.0）"),
     # lgbm_v1 专属（不传则用 LGBMv1Config 默认值）
     tau: float | None = typer.Option(None, "--tau", help="lgbm_v1 下注门槛：|P(up)-P(down)| 超过它才开仓（默认 0.15）"),
     model_dir: str | None = typer.Option(None, "--model-dir", help="lgbm_v1 折模型目录（默认 models/lgbm_v1）"),
@@ -265,6 +273,11 @@ def run_backtest(
     trail_atr_mult = trail_atr_mult if trail_atr_mult is not None else ed.get("trail_atr_mult", 1.0)
     trail_trigger_r = trail_trigger_r if trail_trigger_r is not None else ed.get("trail_trigger_r", 1.0)
     add_trigger_r = add_trigger_r if add_trigger_r is not None else ed.get("add_trigger_r", 0.3)
+    tp1_r = tp1_r if tp1_r is not None else ed.get("tp1_r", 1.0)
+    tp1_close_frac = tp1_close_frac if tp1_close_frac is not None else ed.get("tp1_close_frac", 0.5)
+    breakeven_after_r = (
+        breakeven_after_r if breakeven_after_r is not None else ed.get("breakeven_after_r", 1.0)
+    )
 
     # 根据 required_intervals 决定加载哪些时间周期
     intervals_to_load = list(rule_strategy.required_intervals)
@@ -357,6 +370,9 @@ def run_backtest(
             add_trigger_r=add_trigger_r,
             trail_trigger_r=trail_trigger_r,
             trail_atr_mult=trail_atr_mult,
+            tp1_r=tp1_r,
+            tp1_close_frac=tp1_close_frac,
+            breakeven_after_r=breakeven_after_r,
         )
 
         def signal_fn(bar, row, htf, dt):
@@ -381,7 +397,10 @@ def run_backtest(
         typer.echo(f"  交易次数: {result.total_trades}  胜率: {result.win_rate:.1%}  盈亏比: {result.payoff_ratio:.2f}")
         typer.echo(f"  Profit Factor: {result.profit_factor:.2f}")
         typer.echo(f"  平均持仓: {result.avg_bars_held:.1f} 根 ({base_interval})")
-        typer.echo(f"  金字塔加仓: {engine._add_count_total} 次成功 / {engine._add_skip_count} 次跳过")
+        typer.echo(
+            f"  金字塔加仓: {engine.ledger.add_count_total} 次成功 /"
+            f" {engine.ledger.add_skip_count} 次跳过"
+        )
         typer.echo(f"\n完整报告: {report_dir / 'report.html'}")
         typer.echo(f"指标: {report_dir / 'metrics.json'}")
         typer.echo(f"净值: {report_dir / 'equity.csv'}")
@@ -434,6 +453,99 @@ def train_model(
     )
     typer.echo(f"模型目录: {Path(cfg.out_dir) / cfg.symbol}")
     typer.echo(f"折报告:   {Path(cfg.out_dir) / cfg.symbol / 'folds.json'}")
+
+
+def _paper_service(
+    s: Settings,
+    *,
+    symbol: str | None,
+    strategy: str | None,
+    push: bool,
+    online: bool,
+) -> PaperService:
+    """构造服务实例。策略分发只靠注册表 + `symbols.yaml` 的 strategies 列表，
+    CLI 不判断"这个策略该用哪些参数"（那是 `BaseStrategy.build` 与 `engine_defaults` 的事）。"""
+    return PaperService(
+        s,
+        push=push,
+        symbols=[symbol] if symbol else None,
+        strategies=[strategy] if strategy else None,
+        store=Store(s.db_path),
+        client=build_rest_client(s) if online else None,
+    )
+
+
+@paper_app.command("run")
+def paper_run(
+    symbol: str | None = typer.Option(None, help="只跑该品种（默认 symbols.yaml 全部 enabled）"),
+    strategy: str | None = typer.Option(None, help="只跑该策略（默认品种的 strategies 列表）"),
+    push: bool = typer.Option(True, "--push/--no-push", help="--no-push 只落库不发飞书"),
+    pull: bool = typer.Option(True, "--pull/--no-pull", help="--no-pull 不访问交易所，只用本地数据"),
+    level: str | None = typer.Option(None, "--log-level"),
+) -> None:
+    """常驻运行：按 5m 收盘节拍增量补数据、多策略并行推理、纸面撮合并推送卡片。"""
+    s = _boot(level)
+    with _paper_service(s, symbol=symbol, strategy=strategy, push=push, online=pull) as svc:
+        typer.echo(
+            f"paper 服务启动：{len(svc.targets)} 个品种，"
+            f"{len(svc.runners) or sum(len(c['strategies']) for c in svc.targets.values())} 个策略账户，"
+            f"轮询 {svc.runtime.poll_sec:g}s，push={push}，pull={pull}"
+        )
+        svc.run_forever()
+
+
+@paper_app.command("once")
+def paper_once(
+    symbol: str | None = typer.Option(None),
+    strategy: str | None = typer.Option(None),
+    push: bool = typer.Option(True, "--push/--no-push"),
+    pull: bool = typer.Option(True, "--pull/--no-pull"),
+    level: str | None = typer.Option(None, "--log-level"),
+) -> None:
+    """只跑一轮就退出，用于部署后手工验证链路（首轮为观察轮，不出信号）。"""
+    s = _boot(level)
+    with _paper_service(s, symbol=symbol, strategy=strategy, push=push, online=pull) as svc:
+        reports = svc.run_forever(once=True)
+    if not reports:
+        typer.echo("本轮没有账户需要处理（没有新 bar，且数据不滞后）")
+    for rep in reports:
+        typer.echo(rep.summary())
+        for ev in rep.events:
+            typer.echo(
+                f"  - {ev.kind} @ {to_dt(ev.ts):%Y-%m-%d %H:%M}"
+                + (f" qty={ev.decision.qty:g}" if ev.decision else "")
+            )
+
+
+@paper_app.command("status")
+def paper_status_cmd(
+    as_json: bool = typer.Option(False, "--json", help="输出机器可读的账户状态"),
+    level: str | None = typer.Option(None, "--log-level"),
+) -> None:
+    """查看纸面账户：断点落后几根 bar、净值、持仓、闸门冷却与推送统计。只读本地库。"""
+    s = _boot(level)
+    with Store(s.db_path) as store:
+        rows = paper_status(store)
+    if as_json:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        typer.echo("还没有任何纸面账户（先跑 quant paper once）")
+        return
+    for r in rows:
+        pos = r["position"]
+        pos_txt = "空仓" if pos is None else (
+            f"{'多' if pos['side'] == 'long' else '空'} {pos['qty']:g}"
+            f" @ {pos['avg_entry_price']:,.2f}（SL {pos['stop_loss']:,.2f}"
+            f"，加仓 {pos['add_count']} 次，TP1 {'已' if pos['tp1_done'] else '未'}触发）"
+        )
+        pause = "无" if not r["pause_until_ms"] else to_dt(r["pause_until_ms"]).strftime("%m-%d %H:%M")
+        typer.echo(
+            f"{r['symbol']} {r['strategy']}: 净值 {r['equity']:,.2f}"
+            f"（期初 {r['initial_equity']:,.0f}，已实现 {r['realized_pnl']:+,.2f}）｜ "
+            f"断点落后 {r['behind_bars'] if r['behind_bars'] is not None else '—'} 根 ｜ "
+            f"信号 {r['signals']} 条（未送达 {r['unsent']}）｜ 冷却至 {pause} ｜ {pos_txt}"
+        )
 
 
 if __name__ == "__main__":

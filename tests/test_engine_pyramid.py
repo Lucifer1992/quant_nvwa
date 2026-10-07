@@ -1,11 +1,11 @@
 """金字塔加仓机制单元测试。
 
-验证目标：
-  1. _scale_in 试仓逻辑：创建 position、扣 margin、记录 add_levels
-  2. _scale_in 加仓逻辑：加权均价、追加 qty、追加 margin
-  3. _should_add 条件判断：浮盈 R + swing 突破
-  4. _update_trailing_stop：激活前不动，激活后跟随
-  5. _check_stops B 模式：用 bar.low/bar.high + 中点时间
+验证目标（撮合与持仓管理已抽到 backtest/position.py，回测与 paper 共用同一份实现）：
+  1. open_or_add 试仓逻辑：创建 position、扣 margin、记录 add_levels
+  2. open_or_add 加仓逻辑：加权均价、追加 qty、追加 margin
+  3. should_add 条件判断：浮盈 R + swing 突破
+  4. update_trailing：激活前不动，激活后跟随
+  5. settle_price_exits B 模式：用 bar.low/bar.high + 中点时间
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant.backtest.engine import BacktestConfig, BacktestEngine
+from quant.backtest.position import should_add, update_trailing
 from quant.core.contracts import Bar, SymbolSpec
 from quant.risk.sizing import compute_risk_size
 from quant.core.contracts import RiskDecision
@@ -83,7 +84,7 @@ def engine():
 
 
 class TestPyramidEntry:
-    """测试 _scale_in 试仓逻辑。"""
+    """测试 open_or_add 试仓逻辑。"""
 
     def test_first_entry_creates_position(self, engine):
         """第一次入场应该创建 Position、扣 margin、记录 add_levels。"""
@@ -102,20 +103,20 @@ class TestPyramidEntry:
             equity_usdt=100.0, risk_usdt=1.0,
         )
 
-        initial_cash = engine.cash
-        engine._scale_in(signal, decision, bar)
+        initial_cash = engine.ledger.cash
+        engine.ledger.open_or_add(signal, decision, bar)
 
-        assert engine.position is not None
-        assert engine.position.side == "long"
-        assert engine.position.qty == 0.05
-        assert engine.position.add_count == 0
-        assert len(engine.position.add_levels) == 1
+        assert engine.ledger.position is not None
+        assert engine.ledger.position.side == "long"
+        assert engine.ledger.position.qty == 0.05
+        assert engine.ledger.position.add_count == 0
+        assert len(engine.ledger.position.add_levels) == 1
         # cash 减少 margin + fee
         expected_fee = 0.05 * (100 * 1.0002) * 0.0005  # entry_price × taker
-        assert abs(engine.cash - (initial_cash - 50.0 - expected_fee)) < 0.01
+        assert abs(engine.ledger.cash - (initial_cash - 50.0 - expected_fee)) < 0.01
         # SL 基于实际入场价调整（不再是 signal.price_ref=104）
         expected_sl = 100 * 1.0002 - 1.5 * 5.0  # entry - 1.5*ATR
-        assert abs(engine.position.stop_loss - expected_sl) < 0.01
+        assert abs(engine.ledger.position.stop_loss - expected_sl) < 0.01
 
     def test_add_increases_qty_and_updates_avg(self, engine):
         """加仓应该累计 qty、加权均价、累计 margin。"""
@@ -133,7 +134,7 @@ class TestPyramidEntry:
             leverage=10.0, margin_usdt=50.0, stop_loss=96.5,
             equity_usdt=100.0, risk_usdt=1.0,
         )
-        engine._scale_in(signal1, decision1, bar1)
+        engine.ledger.open_or_add(signal1, decision1, bar1)
 
         # 加仓：第二根 bar，价格上涨
         ts2 = ts1 + timedelta(minutes=5)
@@ -149,26 +150,26 @@ class TestPyramidEntry:
             leverage=10.0, margin_usdt=33.9, stop_loss=105.5,
             equity_usdt=100.0, risk_usdt=0.0,
         )
-        engine._scale_in(signal2, decision2, bar2)
+        engine.ledger.open_or_add(signal2, decision2, bar2)
 
-        assert engine.position.qty == 0.08  # 0.05 + 0.03
-        assert engine.position.add_count == 1
-        assert len(engine.position.add_levels) == 2
+        assert engine.ledger.position.qty == 0.08  # 0.05 + 0.03
+        assert engine.ledger.position.add_count == 1
+        assert len(engine.ledger.position.add_levels) == 2
         # 加权均价 = (100.02 * 0.05 + 110.02 * 0.03) / 0.08
         # = (5.001 + 3.3006) / 0.08 = 8.3016 / 0.08 = 103.77
-        assert abs(engine.position.avg_entry_price - 103.77) < 0.5
+        assert abs(engine.ledger.position.avg_entry_price - 103.77) < 0.5
 
 
 class TestShouldAdd:
-    """测试 _should_add 加仓条件。"""
+    """测试 should_add 加仓条件。"""
 
     def test_no_position_no_add(self, engine):
-        """无持仓时 _should_add 应返回 False。"""
+        """无持仓时 should_add 应返回 False。"""
         bar = make_bar(datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc),
                        100, 105, 99, 104)
         # 构造 row with swing_high=102
         row = pd.Series({"close": 104, "swing_high": 102, "swing_low": 99, "atr": 5.0})
-        assert engine._should_add(row, bar) is False
+        assert should_add(engine.ledger.position, engine.cfg, row, bar) is False
 
     def test_position_no_float_no_add(self, engine):
         """有持仓但无浮盈时不应加仓。"""
@@ -176,7 +177,7 @@ class TestShouldAdd:
         ts = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
         bar = make_bar(ts, 100, 105, 99, 104)
         # 构造一个 long 持仓，均价 105（高于当前价）
-        engine.position = Position(
+        engine.ledger.position = Position(
             position_id="t1", symbol="ETHUSDT", side="long",
             qty=0.05, entry_price=105.0, avg_entry_price=105.0,
             entry_ts=ts, margin_usdt=50.0, stop_loss=96.5, take_profits=(),
@@ -184,14 +185,14 @@ class TestShouldAdd:
         )
         row = pd.Series({"close": 104, "swing_high": 110, "swing_low": 99, "atr": 5.0})
         # 当前价 104 < 均价 105 → 浮亏
-        assert engine._should_add(row, bar) is False
+        assert should_add(engine.ledger.position, engine.cfg, row, bar) is False
 
     def test_position_with_float_breakout_should_add(self, engine):
         """有持仓 + 浮盈 + 突破 swing high → 应加仓。"""
         from quant.core.contracts import Position
         ts = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
         bar = make_bar(ts, 100, 110, 99, 108)  # close=108 > swing_high=106
-        engine.position = Position(
+        engine.ledger.position = Position(
             position_id="t1", symbol="ETHUSDT", side="long",
             qty=0.05, entry_price=100.0, avg_entry_price=100.0,
             entry_ts=ts, margin_usdt=50.0, stop_loss=92.5, take_profits=(),
@@ -200,26 +201,26 @@ class TestShouldAdd:
         # 当前价 108 > 均价 100 → 浮盈 (108-100)/(1.5*5) = 1.07R > 0.3R 阈值
         # 当前 close > swing_high=106 → 突破
         row = pd.Series({"close": 108, "swing_high": 106, "swing_low": 99, "atr": 5.0})
-        assert engine._should_add(row, bar) is True
+        assert should_add(engine.ledger.position, engine.cfg, row, bar) is True
 
 
 class TestTrailingStop:
-    """测试 _update_trailing_stop 移动止损。"""
+    """测试 update_trailing 移动止损。"""
 
     def test_no_trail_when_below_trigger(self, engine):
         """浮盈 < trail_trigger_r 时不激活，止损不动。"""
         from quant.core.contracts import Position
         ts = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
         bar = make_bar(ts, 100, 101, 99, 100.5)
-        engine.position = Position(
+        engine.ledger.position = Position(
             position_id="t1", symbol="ETHUSDT", side="long",
             qty=0.05, entry_price=100.0, avg_entry_price=100.0,
             entry_ts=ts, margin_usdt=50.0, stop_loss=92.5, take_profits=(),
             entry_atr=5.0, trailing_peak_price=100.5,
         )
-        engine._update_trailing_stop(bar)
-        assert engine.position.trailing_active is False
-        assert engine.position.stop_loss == 92.5  # 不变
+        update_trailing(engine.ledger.position, engine.cfg, bar)
+        assert engine.ledger.position.trailing_active is False
+        assert engine.ledger.position.stop_loss == 92.5  # 不变
 
     def test_trail_activates_at_threshold(self, engine):
         """浮盈 ≥ trail_trigger_r 时激活，止损开始跟随。"""
@@ -228,16 +229,16 @@ class TestTrailingStop:
         # 当前价 110，相对均价 100，浮盈 = (110-100)/(1.5*5) = 1.33R ≥ 1.0R
         # bar.high = close = 110（peak = 110）
         bar = make_bar(ts, 100, 110, 99, 110)
-        engine.position = Position(
+        engine.ledger.position = Position(
             position_id="t1", symbol="ETHUSDT", side="long",
             qty=0.05, entry_price=100.0, avg_entry_price=100.0,
             entry_ts=ts, margin_usdt=50.0, stop_loss=92.5, take_profits=(),
             entry_atr=5.0, trailing_peak_price=110.0,
         )
-        engine._update_trailing_stop(bar)
-        assert engine.position.trailing_active is True
+        update_trailing(engine.ledger.position, engine.cfg, bar)
+        assert engine.ledger.position.trailing_active is True
         # 新 SL = peak(110) - 1*ATR(5) = 105（向有利方向）
-        assert engine.position.stop_loss == 105.0
+        assert engine.ledger.position.stop_loss == 105.0
 
     def test_trail_only_moves_in_favorable_direction(self, engine):
         """激活后价格回撤，止损不会向不利方向移动。"""
@@ -245,15 +246,15 @@ class TestTrailingStop:
         ts = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
         # 当前价 105（回撤），peak 仍是 110（之前的高点）
         bar = make_bar(ts, 100, 105, 99, 105)
-        engine.position = Position(
+        engine.ledger.position = Position(
             position_id="t1", symbol="ETHUSDT", side="long",
             qty=0.05, entry_price=100.0, avg_entry_price=100.0,
             entry_ts=ts, margin_usdt=50.0, stop_loss=105.0, take_profits=(),  # 已激活，SL=105
             entry_atr=5.0, trailing_active=True, trailing_peak_price=110.0,
         )
-        engine._update_trailing_stop(bar)
+        update_trailing(engine.ledger.position, engine.cfg, bar)
         # peak 不变（110 > 105），新 SL = 110 - 5 = 105，max(105, 105) = 105（不变）
-        assert engine.position.stop_loss == 105.0
+        assert engine.ledger.position.stop_loss == 105.0
 
 
 class TestSizing:

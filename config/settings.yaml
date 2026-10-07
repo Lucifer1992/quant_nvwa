@@ -21,3 +21,10 @@ backtest:
   default_start: "2024-01-01"
   intra_bar_path: bar_hl                # bar_hl | exact_1m（1m 数据回填后切换）
   sl_first_on_conflict: true            # 同一根 bar 同时触及 SL/TP 时保守取 SL
+
+paper:
+  # 每轮先以 observe 模式重放这么多天：只把策略内部状态（趋势状态机、冷却计数、
+  # ML 特征帧）推到断点位置，账本一行不写 —— 所以首轮不会把历史信号补推一遍
+  replay_days: 7
+  # 轮询间隔：到点先看最新收盘 bar 是否已落库，没有新 bar 就不占 REST 配额也不重算指标
+  poll_sec: 20

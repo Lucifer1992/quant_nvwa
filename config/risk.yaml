@@ -1,6 +1,6 @@
 # 风控参数。回测链路今天只读取 caps.global_max_leverage 与 stops.*（供 validate_config
 # 交叉校验，并与 CLI 的 --lev/--sl-atr/--tp-atr 默认值保持一致）；
-# caps/guard 中标注 [paper] 的键是模拟交易服务（quant paper）的输入，回测不生效。
+# caps/guard 中标注 [paper] 的键由模拟交易服务（quant paper）执行拦截，回测不生效。
 account:
   initial_equity_usdt: 100          # 实盘/模拟本金 100U；回测用 --equity 覆盖
 
@@ -8,11 +8,11 @@ sizing:
   method: fixed_risk                # 唯一实现：单笔风险 = equity × risk_pct
   risk_pct: 0.01                    # 单笔最大亏损占权益比
 
-caps:
+caps:                               # [paper] 闸门：拦截新开仓，不强平已有持仓
   global_max_leverage: 10.0         # 固定全程 10×，margin = notional / 该值
-  max_notional_usdt: 5000           # [paper] 回测未强制
-  max_margin_per_symbol_pct: 0.30   # [paper] 回测未强制
-  max_new_entries_per_day: 4        # [paper] 回测未强制
+  max_notional_usdt: 5000           # 单笔名义上限（回测未实现）
+  max_margin_per_symbol_pct: 0.30   # 单品种保证金占权益上限（回测未实现）
+  max_new_entries_per_day: 4        # 每日本金试仓次数（回测未实现）
 
 stops:
   atr_interval: 5m                  # 与 base_interval 同尺度；改动必须同步 symbols.yaml
@@ -21,11 +21,12 @@ stops:
   tp_atr_mult: 3.0                  # 必须 > sl_atr_mult，validate_config 会检查
   time_stop_bars: 288               # 以 base_interval 计数，288 × 5m = 24h
   allow_short: true
-  # 以下字段尚未实现，只记录设计意图（引擎目前是 TP 全平、无保本移动）：
-  # tp1_r: 1.0                      # 到 1R 平一半
-  # tp1_close_frac: 0.5
-  # breakeven_after_r: 1.0          # 到 1R 后止损移到开仓价
-  # trail_atr_mult: 3.0             # 实际跟随距离由 CLI/engine_defaults 的 --trail-atr-mult 决定
+  # 分批止盈 + 保本移动：到 1R 平一半，同时把止损抬到开仓价，剩下一半去博 TP/移动止损。
+  # 回测与 paper 都生效（同一个执行层），<=0 表示关闭。
+  tp1_r: 1.0
+  tp1_close_frac: 0.5
+  breakeven_after_r: 1.0
+  # trail_atr_mult 的实际跟随距离由 CLI/engine_defaults 的 --trail-atr-mult 决定，这里不声明
 
 margin:
   # 仅作 exchangeInfo 不可用时的兜底；正常回填会用交易所真实字段覆盖
@@ -35,14 +36,17 @@ margin:
   liquidation_fee_rate: 0.0125
   isolated: true
 
-guard:                              # [paper] 模拟交易服务的风控闸门，回测不生效
-  daily_loss_stop_pct: 0.03
-  max_drawdown_pause_pct: 0.15
-  max_consecutive_losses: 5
+guard:                              # [paper] 闸门：拦截新开仓，回测不生效
+  daily_loss_stop_pct: 0.03         # 24h 内已实现亏损达权益的 3% → 暂停开仓
+  max_drawdown_pause_pct: 0.15      # 距历史高点回撤 15% → 暂停开仓
+  max_consecutive_losses: 5         # 连亏 5 笔 → 冷却 cooldown_hours
   cooldown_hours: 24
-  stale_data_max_gap_min: 5
+  stale_data_max_gap_min: 5         # 行情滞后超 5 分钟 → 本轮不撮合并告警
 
 costs:
   taker_fee_rate: 0.0005            # 全 taker 成交：入场与出场都按吃单计价
   slippage_bps: 2.0                 # 每笔成交都取不利方向
-  include_funding: true
+  # 往返 taker = 名义的 0.1%，10× 下就是保证金的 1%；资金费在 10× 下三天只占保证金
+  # 约 0.24%（实测 ETHUSDT 2026-04~10 均值），量级太小，作为成本项只会引入无关变量，
+  # 所以不计入净值。资金费数据照常入库，ML 特征仍然用它。
+  include_funding: false

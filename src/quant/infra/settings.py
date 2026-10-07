@@ -178,4 +178,15 @@ def validate_config(s: Settings) -> list[str]:
     tp_mult, sl_mult = stops.get("tp_atr_mult"), stops.get("sl_atr_mult")
     if tp_mult and sl_mult and tp_mult <= sl_mult:
         problems.append(f"stops.tp_atr_mult={tp_mult} <= sl_atr_mult={sl_mult}，盈亏比为负，策略不可能正期望")
+    tp1_r = stops.get("tp1_r")
+    if tp_mult and sl_mult and tp1_r:
+        full_tp_r = tp_mult / sl_mult
+        if tp1_r >= full_tp_r:
+            problems.append(
+                f"stops.tp1_r={tp1_r} >= 全平止盈的 R 数 {full_tp_r:.2f}"
+                f"（= tp_atr_mult/sl_atr_mult），分批止盈永远不会触发"
+            )
+    frac = stops.get("tp1_close_frac")
+    if frac is not None and not 0 < float(frac) < 1:
+        problems.append(f"stops.tp1_close_frac={frac} 必须在 (0, 1) 之间，否则分批止盈会变成全平")
     return problems

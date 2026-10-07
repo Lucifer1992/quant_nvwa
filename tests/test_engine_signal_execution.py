@@ -20,7 +20,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant.backtest.engine import BacktestConfig, BacktestEngine, _precompute
+from quant.backtest.engine import BacktestConfig, BacktestEngine
+from quant.backtest.precompute import precompute
+from quant.backtest.position import update_trailing
 from quant.core.contracts import Action, Bar, Mode, Signal, SymbolSpec
 
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -60,7 +62,7 @@ def make_engine(**kw) -> BacktestEngine:
         "close": [2000.0] * n, "volume": [10.0] * n,
     })
     engine = BacktestEngine(BacktestConfig(**cfg_kw), {"5m": df}, make_spec())
-    pre = _precompute(df)
+    pre = precompute(df)
     engine._df5_row = pre.iloc[-1]  # 已出 ATR 值的一行
     engine._df5_nan_row = pre.iloc[0]  # 预热期 ATR 仍为 NaN 的一行
     return engine
@@ -89,37 +91,37 @@ class TestAtrFromStrategy:
         eng = make_engine()
         row = eng._df5_row
         assert row["atr"] > 0 and row["atr"] != 50.0  # 5m ATR 与传入值不同才有意义
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), row)
-        assert eng.position is not None
-        assert eng.position.entry_atr == 50.0
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), row)
+        assert eng.ledger.position is not None
+        assert eng.ledger.position.entry_atr == 50.0
 
     def test_sl_tp_use_strategy_atr(self):
         eng = make_engine()
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        entry = eng.position.entry_price
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        entry = eng.ledger.position.entry_price
         # sl_atr_mult=2.0, tp_atr_mult=3.5，且开仓滑点为不利方向
-        assert eng.position.stop_loss == pytest.approx(entry - 2.0 * 50.0, abs=1e-6)
-        assert eng.position.tp_price == pytest.approx(entry + 3.5 * 50.0, abs=1e-6)
+        assert eng.ledger.position.stop_loss == pytest.approx(entry - 2.0 * 50.0, abs=1e-6)
+        assert eng.ledger.position.tp_price == pytest.approx(entry + 3.5 * 50.0, abs=1e-6)
 
     def test_fallback_to_base_atr(self):
         eng = make_engine()
         row = eng._df5_row
-        eng._execute_signal(sig(Action.OPEN_LONG), bar_at(0), row)
-        assert eng.position.entry_atr == pytest.approx(float(row["atr"]))
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG), bar_at(0), row)
+        assert eng.ledger.position.entry_atr == pytest.approx(float(row["atr"]))
 
     def test_fallback_when_base_atr_still_warming_up(self):
         # 预热期 5m ATR 为 NaN，用 price_ref×0.5% 兜底而不是把 NaN 带进止损
         eng = make_engine()
-        eng._execute_signal(sig(Action.OPEN_LONG), bar_at(0), eng._df5_nan_row)
-        assert eng.position.entry_atr == pytest.approx(2000.0 * 0.005)
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG), bar_at(0), eng._df5_nan_row)
+        assert eng.ledger.position.entry_atr == pytest.approx(2000.0 * 0.005)
 
 
 class TestSizeMult:
     """E3：per-signal 仓位倍数（4h 软对齐用它减仓，不允许超额）。"""
 
     def _margin(self, eng, **meta):
-        eng._execute_signal(sig(Action.OPEN_LONG, **meta), bar_at(0), eng._df5_row)
-        return eng.position.margin_usdt
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, **meta), bar_at(0), eng._df5_row)
+        return eng.ledger.position.margin_usdt
 
     def test_scales_margin(self):
         assert self._margin(make_engine()) == pytest.approx(10.0, abs=0.01)
@@ -138,26 +140,26 @@ class TestCloseSignal:
 
     def test_close_long_executes_at_next_bar_with_adverse_slip(self):
         eng = make_engine()
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        assert eng.position is not None
-        eng._execute_signal(sig(Action.CLOSE_LONG), bar_at(1, o=2050.0), eng._df5_row)
-        assert eng.position is None
-        assert len(eng.trades) == 1
-        t = eng.trades[0]
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        assert eng.ledger.position is not None
+        eng.ledger.execute_signal(sig(Action.CLOSE_LONG), bar_at(1, o=2050.0), eng._df5_row)
+        assert eng.ledger.position is None
+        assert len(eng.ledger.trades) == 1
+        t = eng.ledger.trades[0]
         assert t.reason == "signal"
         # 多头平仓是卖出：成交价按不利方向打折
         assert t.exit_price == pytest.approx(2050.0 * (1 - 2.0 / 10000), abs=1e-6)
 
     def test_close_ignored_when_flat(self):
         eng = make_engine()
-        eng._execute_signal(sig(Action.CLOSE_LONG), bar_at(0), eng._df5_row)
-        assert eng.trades == []
+        eng.ledger.execute_signal(sig(Action.CLOSE_LONG), bar_at(0), eng._df5_row)
+        assert eng.ledger.trades == []
 
     def test_close_ignored_for_opposite_side(self):
         eng = make_engine()
-        eng._execute_signal(sig(Action.OPEN_SHORT, atr=50.0), bar_at(0), eng._df5_row)
-        eng._execute_signal(sig(Action.CLOSE_LONG), bar_at(1), eng._df5_row)
-        assert eng.position is not None and eng.position.side == "short"
+        eng.ledger.execute_signal(sig(Action.OPEN_SHORT, atr=50.0), bar_at(0), eng._df5_row)
+        eng.ledger.execute_signal(sig(Action.CLOSE_LONG), bar_at(1), eng._df5_row)
+        assert eng.ledger.position is not None and eng.ledger.position.side == "short"
 
 
 class TestFlip:
@@ -165,15 +167,15 @@ class TestFlip:
 
     def test_opposite_open_replaces_position(self):
         eng = make_engine()
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        first_entry = eng.position.entry_price
-        eng._execute_signal(sig(Action.OPEN_SHORT, atr=50.0), bar_at(1, o=2000.0), eng._df5_row)
-        assert eng.position is not None and eng.position.side == "short"
-        assert len(eng.trades) == 1
-        assert eng.trades[0].side == "long"
-        assert eng.trades[0].exit_price == pytest.approx(2000.0 * (1 - 2.0 / 10000), abs=1e-6)
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        first_entry = eng.ledger.position.entry_price
+        eng.ledger.execute_signal(sig(Action.OPEN_SHORT, atr=50.0), bar_at(1, o=2000.0), eng._df5_row)
+        assert eng.ledger.position is not None and eng.ledger.position.side == "short"
+        assert len(eng.ledger.trades) == 1
+        assert eng.ledger.trades[0].side == "long"
+        assert eng.ledger.trades[0].exit_price == pytest.approx(2000.0 * (1 - 2.0 / 10000), abs=1e-6)
         # 新仓是做空开仓：卖出，成交价打折（与 first_entry 的买入价不同方向）
-        assert eng.position.entry_price == pytest.approx(2000.0 * (1 - 2.0 / 10000), abs=1e-6)
+        assert eng.ledger.position.entry_price == pytest.approx(2000.0 * (1 - 2.0 / 10000), abs=1e-6)
         assert first_entry == pytest.approx(2000.0 * (1 + 2.0 / 10000), abs=1e-6)
 
 
@@ -182,12 +184,12 @@ class TestTrailingAtrMult:
 
     def test_distance_follows_config(self):
         eng = make_engine(trail_atr_mult=1.5, trail_trigger_r=1.0)
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=10.0), bar_at(0), eng._df5_row)
-        pos = eng.position
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=10.0), bar_at(0), eng._df5_row)
+        pos = eng.ledger.position
         entry = pos.entry_price
         # 浮盈需 ≥ sl_atr_mult×ATR×trail_trigger_r = 20 才激活
         peak_bar = bar_at(1, o=entry, h=entry + 60.0, l=entry, c=entry + 50.0)
-        eng._update_trailing_stop(peak_bar)
+        update_trailing(eng.ledger.position, eng.cfg, peak_bar)
         assert pos.trailing_active
         assert pos.stop_loss == pytest.approx(pos.trailing_peak_price - 1.5 * 10.0, abs=1e-6)
 
@@ -222,7 +224,7 @@ class TestNoLookaheadExecution:
 
         result = eng.run(fn)
         assert calls["n"] > 0, "信号函数从未被调用（预热长度或时间窗口不对）"
-        entry_fills = [f for f in eng.fills if f.reason.value == "signal"]
+        entry_fills = [f for f in eng.ledger.fills if f.reason.value == "signal"]
         assert len(entry_fills) == 1
         # 实际成交价 = 下一根 bar 的 open(2000) 加不利滑点，而不是当根的 1900
         assert entry_fills[0].price == pytest.approx(2000.0 * (1 + 2.0 / 10000), abs=1e-6)

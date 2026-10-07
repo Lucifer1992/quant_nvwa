@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -22,7 +23,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant.backtest.engine import BacktestConfig, BacktestEngine, TradeRecord, _precompute
+from quant.backtest.engine import BacktestConfig, BacktestEngine, TradeRecord
+from quant.backtest.precompute import precompute
 from quant.core.contracts import Action, Bar, FillReason, Mode, Signal, SymbolSpec
 
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -68,7 +70,7 @@ def make_engine(funding: pd.DataFrame | None = None, **cfg_kw) -> BacktestEngine
     cfg_defaults.update(cfg_kw)
     df = _frame()
     eng = BacktestEngine(BacktestConfig(**cfg_defaults), {"5m": df}, make_spec(), funding=funding)
-    pre = _precompute(df)
+    pre = precompute(df)
     eng._df5_row = pre.iloc[-1]
     return eng
 
@@ -96,35 +98,37 @@ class TestExitOrdering:
 
     def _open_long(self, **kw) -> BacktestEngine:
         eng = make_engine(**kw)
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
         return eng
 
     def test_conflict_resolves_as_stop(self):
         eng = self._open_long()
-        pos = eng.position
+        pos = eng.ledger.position
         assert pos.stop_loss < 2000.0 < pos.tp_price
         # 一根 bar 的高低点同时越过 SL 与 TP，无法证明哪一侧先到
-        eng._check_exits(bar_at(1, o=2000.0, h=2300.0, l=1800.0, c=2100.0))
-        assert len(eng.trades) == 1
-        t = eng.trades[0]
+        eng.ledger.settle_price_exits(bar_at(1, o=2000.0, h=2300.0, l=1800.0, c=2100.0))
+        assert len(eng.ledger.trades) == 1
+        t = eng.ledger.trades[0]
         assert t.reason == "sl"
         # B 模式：多头按 bar.low 最坏成交，再扣不利滑点
         assert t.exit_price == pytest.approx(1800.0 * (1 - SLIP), abs=1e-6)
 
     def test_conflict_can_be_configured_to_tp(self):
         eng = self._open_long(sl_first_on_conflict=False)
-        tp = eng.position.tp_price
-        eng._check_exits(bar_at(1, o=2000.0, h=2300.0, l=1800.0, c=2100.0))
-        assert eng.trades[0].reason == "tp"
-        assert eng.trades[0].exit_price == pytest.approx(tp * (1 - SLIP), abs=1e-6)
+        tp = eng.ledger.position.tp_price
+        eng.ledger.settle_price_exits(bar_at(1, o=2000.0, h=2300.0, l=1800.0, c=2100.0))
+        # 一根 bar 越过 1R 与 3.5R：先落 TP1 分批止盈，再按 TP 全平剩余仓位
+        assert [t.reason for t in eng.ledger.trades] == ["tp1", "tp"]
+        assert eng.ledger.trades[-1].exit_price == pytest.approx(tp * (1 - SLIP), abs=1e-6)
+        assert eng.ledger.position is None
 
     def test_stop_exit_time_is_bar_midpoint(self):
         """出场时间不能记成 bar 收盘，否则持仓时长被系统性虚增。"""
         eng = self._open_long()
         b = bar_at(1, h=2300.0, l=1800.0)
-        eng._check_exits(b)
+        eng.ledger.settle_price_exits(b)
         mid = b.ts_open + (b.ts_close - b.ts_open) / 2
-        assert eng.trades[0].exit_time == mid
+        assert eng.ledger.trades[0].exit_time == mid
 
 
 class TestMarginSemantics:
@@ -138,8 +142,8 @@ class TestMarginSemantics:
         名义 20 USDT，10× 下保证金应为 2 USDT，而不是 100。
         """
         eng = make_engine(pyramid_enabled=False)
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        pos = eng.position
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        pos = eng.ledger.position
         assert pos is not None
         assert pos.qty == pytest.approx(0.01)
         # 名义/保证金按信号参考价核算（定仓发生在成交前，只能用 price_ref）；
@@ -150,8 +154,8 @@ class TestMarginSemantics:
 
     def test_pyramid_entry_frac_margin(self):
         eng = make_engine(pyramid_enabled=True)
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        pos = eng.position
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        pos = eng.ledger.position
         # 100 × 0.10 试仓 × 10× 杠杆 / 2000 = 0.05 → 名义 100 → 保证金 10
         assert pos.qty == pytest.approx(0.05)
         assert pos.margin_usdt == pytest.approx(10.0, abs=0.01)
@@ -159,10 +163,10 @@ class TestMarginSemantics:
     def test_sizing_uses_equity_known_at_bar_open(self):
         """定仓只能用上一根收盘的净值；本根收盘 MTM 在成交时还没发生。"""
         eng = make_engine(pyramid_enabled=False)
-        eng.equity_open = 100.0
-        eng.equity = 1000.0          # 假的"本根收盘"净值，若被采用 qty 会放大 10 倍
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        assert eng.position.qty == pytest.approx(0.01)
+        eng.ledger.equity_open = 100.0
+        eng.ledger.equity = 1000.0          # 假的"本根收盘"净值，若被采用 qty 会放大 10 倍
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        assert eng.ledger.position.qty == pytest.approx(0.01)
 
 
 class TestFunding:
@@ -173,48 +177,61 @@ class TestFunding:
             "mark_price": [mark],
         })
 
-    def test_accrues_on_mark_price_and_charges_once(self):
+    def test_funding_off_by_default(self):
+        """成本口径默认剔除资金费：10× 下三天只占保证金约 0.24%，留着只多一个无关变量。"""
         b2 = bar_at(2)
         eng = make_engine(funding=self._funding_df(int(b2.ts_open.timestamp() * 1000)))
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        pos = eng.position
-        cash_after_entry = eng.cash
+        assert eng.cfg.include_funding is False
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        eng.ledger.accrue_funding(int(b2.ts_open.timestamp() * 1000) + IV_MS, 2000.0)
+        assert eng.ledger.funding_since_entry == 0.0
 
-        eng._accrue_funding(int(b2.ts_open.timestamp() * 1000) + IV_MS, 2000.0)
+    def test_accrues_on_mark_price_and_charges_once(self):
+        b2 = bar_at(2)
+        eng = make_engine(
+            funding=self._funding_df(int(b2.ts_open.timestamp() * 1000)), include_funding=True
+        )
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        pos = eng.ledger.position
+        cash_after_entry = eng.ledger.cash
+
+        eng.ledger.accrue_funding(int(b2.ts_open.timestamp() * 1000) + IV_MS, 2000.0)
         # 标记价 2100 优先于传入价 2000；多头付正费率
         expected = pos.qty * 2100.0 * 0.0001
-        assert eng.funding_since_entry == pytest.approx(expected)
+        assert eng.ledger.funding_since_entry == pytest.approx(expected)
         assert pos.funding_paid == pytest.approx(expected)
         # 现金只在平仓时一次性结算，持仓期内不得重复扣
-        assert eng.cash == pytest.approx(cash_after_entry)
+        assert eng.ledger.cash == pytest.approx(cash_after_entry)
 
         exit_px = 2000.0
-        eng._close_trade(bar_at(3), FillReason.SIGNAL, exit_px)
-        t = eng.trades[0]
+        eng.ledger.close_position(bar_at(3), FillReason.SIGNAL, exit_px)
+        t = eng.ledger.trades[0]
         gross = pos.qty * (exit_px - pos.entry_price)
         fee_exit = pos.qty * exit_px * 0.0005
         assert t.pnl == pytest.approx(gross - t.fee - expected)
-        assert eng.cash == pytest.approx(
+        assert eng.ledger.cash == pytest.approx(
             cash_after_entry + pos.margin_usdt + gross - fee_exit - expected
         )
 
     def test_short_receives_positive_rate(self):
         b2 = bar_at(2)
-        eng = make_engine(funding=self._funding_df(int(b2.ts_open.timestamp() * 1000)))
-        eng._execute_signal(sig(Action.OPEN_SHORT, atr=50.0), bar_at(0), eng._df5_row)
-        eng._accrue_funding(int(b2.ts_open.timestamp() * 1000) + IV_MS, 2000.0)
-        assert eng.funding_since_entry < 0            # 正费率下空头收钱
+        eng = make_engine(
+            funding=self._funding_df(int(b2.ts_open.timestamp() * 1000)), include_funding=True
+        )
+        eng.ledger.execute_signal(sig(Action.OPEN_SHORT, atr=50.0), bar_at(0), eng._df5_row)
+        eng.ledger.accrue_funding(int(b2.ts_open.timestamp() * 1000) + IV_MS, 2000.0)
+        assert eng.ledger.funding_since_entry < 0            # 正费率下空头收钱
 
     def test_pointer_advances_while_flat(self):
         """空仓期间的结算必须推进指针，否则会被算进之后才开的仓位。"""
         b1 = bar_at(1)
         t1 = int(b1.ts_open.timestamp() * 1000)
         eng = make_engine(funding=self._funding_df(t1))
-        eng._accrue_funding(t1 + IV_MS, 2000.0)       # 此时无持仓
-        assert eng.funding_since_entry == 0.0
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(2), eng._df5_row)
-        eng._accrue_funding(t1 + 2 * IV_MS, 2000.0)
-        assert eng.funding_since_entry == 0.0         # 旧结算不会被补记
+        eng.ledger.accrue_funding(t1 + IV_MS, 2000.0)       # 此时无持仓
+        assert eng.ledger.funding_since_entry == 0.0
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(2), eng._df5_row)
+        eng.ledger.accrue_funding(t1 + 2 * IV_MS, 2000.0)
+        assert eng.ledger.funding_since_entry == 0.0         # 旧结算不会被补记
 
     def test_can_be_disabled(self):
         b2 = bar_at(2)
@@ -222,9 +239,106 @@ class TestFunding:
             funding=self._funding_df(int(b2.ts_open.timestamp() * 1000)),
             include_funding=False,
         )
-        eng._execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
-        eng._accrue_funding(int(b2.ts_open.timestamp() * 1000) + IV_MS, 2000.0)
-        assert eng.funding_since_entry == 0.0
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        eng.ledger.accrue_funding(int(b2.ts_open.timestamp() * 1000) + IV_MS, 2000.0)
+        assert eng.ledger.funding_since_entry == 0.0
+
+
+class TestTp1Breakeven:
+    """TP1 分批止盈与保本移动止损（回测与 paper 共用这套口径）。
+
+    这组用例的算式：equity 100、price 2000、atr 50、sl 2.0 → R 距离 100，
+    试仓 qty = 100×0.10×10/2000 = 0.05，入场 2000.4，止损 1900.4，TP1 触发价 2100.4，
+    全平 TP 2350.4。
+    """
+
+    def _open_long(self, **kw) -> BacktestEngine:
+        eng = make_engine(**kw)
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        return eng
+
+    def test_partial_close_and_breakeven(self):
+        eng = self._open_long()
+        pos = eng.ledger.position
+        eng.ledger.settle_price_exits(bar_at(1, h=2150.0, l=2050.0, c=2120.0))
+        assert [t.reason for t in eng.ledger.trades] == ["tp1"]
+        t = eng.ledger.trades[0]
+        assert t.qty == pytest.approx(0.025)
+        assert t.exit_price == pytest.approx(2100.4 * (1 - SLIP), abs=1e-6)
+        assert pos.qty == pytest.approx(0.025) and pos.tp1_done
+        # 保本：剩下一半最差也只是平进平出
+        assert pos.stop_loss == pytest.approx(2000.4) and pos.breakeven_done
+        # 保证金与费用按平仓比例分摊，剩余仓位还留着一半
+        assert t.margin_usdt == pytest.approx(pos.margin_usdt)
+        # 开仓腿手续费按平仓比例分摊（一半）+ 平仓腿
+        assert t.fee == pytest.approx(0.025 * (2000.4 + t.exit_price) * 0.0005, rel=1e-6)
+
+    def test_tp1_only_fires_once(self):
+        eng = self._open_long()
+        for i in (1, 2, 3):
+            eng.ledger.settle_price_exits(bar_at(i, h=2150.0, l=2050.0, c=2120.0))
+        assert [t.reason for t in eng.ledger.trades] == ["tp1"]
+
+    def test_same_bar_tightened_stop_can_be_hit(self):
+        """保本后的新止损本根 bar 就生效：越过 1R 又回落到开仓价下方时，剩余仓位按极值止损。"""
+        eng = self._open_long()
+        eng.ledger.settle_price_exits(bar_at(1, h=2150.0, l=1990.0, c=2000.0))
+        assert [t.reason for t in eng.ledger.trades] == ["tp1", "sl"]
+        assert eng.ledger.position is None
+
+    def test_can_be_disabled(self):
+        eng = self._open_long(tp1_r=0.0, breakeven_after_r=0.0)
+        eng.ledger.settle_price_exits(bar_at(1, h=2150.0, l=2050.0, c=2120.0))
+        assert eng.ledger.trades == []
+        assert eng.ledger.position.stop_loss == pytest.approx(1900.4)
+
+    def test_too_small_to_split_only_moves_stop(self):
+        """拆不出合规数量时不重试，但保本照常生效（BTCUSDT 那类 min_qty/min_notional 组合）。"""
+        eng = self._open_long()
+        # 对半拆 = 0.025 < min_qty 0.03 → 不能拆，但仓位本身仍满足 min_notional
+        eng.ledger.spec = replace(make_spec(), min_qty=Decimal("0.03"))
+        pos = eng.ledger.position
+        eng.ledger.settle_price_exits(bar_at(1, h=2150.0, l=2050.0, c=2120.0))
+        assert eng.ledger.trades == []
+        assert pos.tp1_done and pos.qty == pytest.approx(0.05)
+        assert pos.stop_loss == pytest.approx(pos.avg_entry_price)
+
+    def test_partial_then_full_keeps_ledger_invariant(self):
+        """分批平仓后 sum(pnl) 仍等于净值增长：开仓腿手续费按平仓比例分摊，不重不漏。"""
+        eng = self._open_long()
+        led = eng.ledger
+        led.snapshot(bar_at(1, h=2150.0, l=2050.0, c=2120.0))
+        led.settle_price_exits(bar_at(1, h=2150.0, l=2050.0, c=2120.0))
+        led.close_position(bar_at(2), FillReason.SIGNAL, 2080.0)
+        assert led.position is None
+        assert sum(t.pnl for t in led.trades) == pytest.approx(led.cash - eng.cfg.initial_equity, abs=1e-9)
+
+
+class TestLiquidation:
+    """强平价触发平仓：只在没有保护性止损拦住它时兜底。"""
+
+    def _open_long(self, **kw) -> BacktestEngine:
+        eng = make_engine(**kw)
+        eng.ledger.execute_signal(sig(Action.OPEN_LONG, atr=50.0), bar_at(0), eng._df5_row)
+        return eng
+
+    def test_stop_wins_when_both_breached(self):
+        eng = self._open_long()
+        pos = eng.ledger.position
+        assert pos.liq_price < pos.stop_loss           # 10× 下强平价比 ATR 止损更深
+        eng.ledger.settle_price_exits(bar_at(1, h=2010.0, l=1800.0, c=1850.0))
+        assert eng.ledger.trades[0].reason == "sl"
+
+    def test_liq_backstop_when_no_stop(self):
+        eng = self._open_long(tp1_r=0.0, breakeven_after_r=0.0)
+        pos = eng.ledger.position
+        pos.stop_loss = None                            # 没有止损的持仓只剩强平兜底
+        eng.ledger.settle_price_exits(bar_at(1, h=2010.0, l=1800.0, c=1850.0))
+        t = eng.ledger.trades[0]
+        assert t.reason == "liq"
+        assert t.exit_price == pytest.approx(pos.liq_price * (1 - SLIP), abs=1e-6)
+        # 逐仓被打穿：亏掉七成以上保证金
+        assert t.ret_pct < -70
 
 
 class TestMarketCloseSlippage:
@@ -244,7 +358,7 @@ class TestMarketCloseSlippage:
             return sig(Action.OPEN_LONG, price_ref=bar.close, atr=50.0) if calls["n"] == 1 else None
 
         eng.run(fn)
-        t = eng.trades[0]
+        t = eng.ledger.trades[0]
         assert t.reason == "time"
         assert t.exit_price == pytest.approx(2000.0 * (1 - SLIP), abs=1e-6)
 
@@ -280,15 +394,15 @@ class TestLedgerInvariant:
             return sig(action, price_ref=bar.close, atr=50.0) if action else None
 
         result = eng.run(fn)
-        assert len(eng.trades) == 3               # 两笔信号平仓 + 收尾强制 FLAT
-        assert eng.position is None
+        assert len(eng.ledger.trades) == 3               # 两笔信号平仓 + 收尾强制 FLAT
+        assert eng.ledger.position is None
         # 收尾结算已回写净值末点，所以末点等于结算后的现金
-        assert result.final_equity == pytest.approx(eng.cash, abs=1e-9)
-        assert sum(t.pnl for t in eng.trades) == pytest.approx(
+        assert result.final_equity == pytest.approx(eng.ledger.cash, abs=1e-9)
+        assert sum(t.pnl for t in eng.ledger.trades) == pytest.approx(
             result.final_equity - eng.cfg.initial_equity, abs=1e-6
         )
         # 每笔保证金都必须等于 notional/杠杆，且不超过当时的可用权益
-        for t in eng.trades:
+        for t in eng.ledger.trades:
             assert t.margin_usdt <= eng.cfg.initial_equity
             assert t.ret_pct == pytest.approx(t.pnl / t.margin_usdt * 100, abs=1e-6)
 
@@ -299,7 +413,7 @@ class TestDrawdownMeasure:
     def test_peak_to_trough(self):
         eng = make_engine()
         # 2000 根 5m ≈ 7 天：曲线要够长，否则 CAGR 的 1/years 次幂会溢出
-        eng.equity_curve = [100.0] * 500 + [200.0] * 500 + [120.0] * 500 + [150.0] * 500
+        eng.ledger.equity_curve = [100.0] * 500 + [200.0] * 500 + [120.0] * 500 + [150.0] * 500
         res = eng._metrics()
         assert res.max_drawdown == pytest.approx(80.0)
         assert res.max_drawdown_pct == pytest.approx(-40.0)
@@ -317,22 +431,22 @@ class TestPayoffMeasure:
 
     def test_all_winners_is_infinite(self):
         eng = make_engine()
-        eng.equity_curve = [100.0, 101.0, 102.0]
-        eng.trades = [self._trade(1.0), self._trade(1.0)]
+        eng.ledger.equity_curve = [100.0, 101.0, 102.0]
+        eng.ledger.trades = [self._trade(1.0), self._trade(1.0)]
         res = eng._metrics()
         assert res.payoff_ratio == float("inf")
         assert res.profit_factor == float("inf")
 
     def test_ratio_of_avg_pnl(self):
         eng = make_engine()
-        eng.equity_curve = [100.0, 101.0, 100.0, 101.0]
-        eng.trades = [self._trade(3.0), self._trade(3.0), self._trade(-1.0)]
+        eng.ledger.equity_curve = [100.0, 101.0, 100.0, 101.0]
+        eng.ledger.trades = [self._trade(3.0), self._trade(3.0), self._trade(-1.0)]
         res = eng._metrics()
         assert res.payoff_ratio == pytest.approx(3.0)
         assert res.profit_factor == pytest.approx(6.0)
 
     def test_no_trades_is_zero(self):
         eng = make_engine()
-        eng.equity_curve = [100.0, 100.0]
+        eng.ledger.equity_curve = [100.0, 100.0]
         res = eng._metrics()
         assert res.payoff_ratio == 0.0

@@ -5,15 +5,13 @@ import csv
 import json
 import logging
 import textwrap
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from ..core.timeframe import interval_ms
-
-BJ_TZ = timezone(timedelta(hours=8))  # 北京时间 UTC+8
+from ..core.timeframe import BJ_TZ, interval_ms
 
 # 单根 bar 在 tooltip 里最多展开几笔事件，超出折叠成一行提示：
 # 浮窗被 confine 在图表容器内，不限条数就会上下都裁切。

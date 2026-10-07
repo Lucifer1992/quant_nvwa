@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
+
+# 报表、卡片与 [paper] 闸门的"自然日"都按北京时间切，与用户的盯盘口径一致
+BJ_TZ = timezone(timedelta(hours=8))
 
 INTERVAL_MS: dict[str, int] = {
     "1m": 60_000,

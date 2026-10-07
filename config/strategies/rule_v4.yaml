@@ -1,0 +1,49 @@
+# 策略声明文件。运行时参数来自 RuleV4Config 默认值 + CLI 选项，本文件不会被回测加载；
+# 它的作用是 validate_config 的交叉校验输入（base_interval / htf 必须与 symbols.yaml 的
+# intervals 一致），并记录阈值口径与实测结论。
+name: rule_v4
+base_interval: 5m          # 引擎结算节奏（与 symbols.yaml 一致）
+decision_interval: 1h      # 趋势状态机与入场判定都在 1h bar 收盘时推进
+htf: ["4h"]                # 4h 只做软对齐权重，不进 intervals 校验会失败
+
+label: "1h 趋势跟随：1h ADX 强度门 + 回调/突破入场 + 4h 软对齐 + 5m 三选二确认"
+
+params:
+  trend_1h:
+    trend_dir_min: 2           # 方向分绝对值达到它才算 CONFIRMED（方向分 −3..+3）
+    adx_min: 32.0              # 开仓强度门，实测最强的轴：20→−20%、30→+18%、32→+22%、40→+17%
+    reversal_dir_score: 2      # 反向方向分达到它才算一次反转
+    reversal_bars: 2           # 连续 N 根反转才算破位（回调不算）
+    adx_ranging_exit: 15.0     # 持仓中 ADX 掉到这里以下视为趋势熄火
+    slope_atr_ratio: 0.15      # 1h EMA20 的 6 小时斜率需超过 0.15×ATR 才算推进
+  entry:
+    pullback_atr: 1.5          # 自 1h 腿极值回撤门槛（×ATR1h）
+    ema_band_atr_ratio: 0.60   # 触及 1h EMA20 带的容差；0.2 时半年只触发 2 次回调入口
+    confirm_requires: 2        # 5m 三选二确认
+    vol_mult: 1.2              # 放量确认倍数
+    min_bars_between_entries: 12   # 两次入场信号至少间隔 N 根 5m（=1 小时）
+  align_4h:
+    w4_aligned: 1.00
+    w4_neutral: 0.85
+    w4_weak_against: 0.70
+    w4_blocked: 0.00
+    adx_4h_trending: 20.0
+    adx_4h_strong: 25.0
+  allow_short: true
+
+engine_defaults:           # 由 RuleV4Strategy.engine_defaults() 提供，CLI 不传参时生效
+  sl_atr_mult: 2.0         # 1.8 会退化成噪音止损（半年 +18% → 0%）
+  tp_atr_mult: 3.5
+  time_stop_bars: 864      # 3 天：引擎默认 96 根（8 小时）会在趋势腿中段强平
+  trail_atr_mult: 1.5
+  trail_trigger_r: 1.0
+  add_trigger_r: 1.0
+  # tp1_r / tp1_close_frac / breakeven_after_r 不在此声明，取 risk.yaml stops 的 1R/0.5/1R
+
+# 实测结论（保守口径：止损按 bar 极值成交 + 中点时间，全 taker 手续费与不利滑点）：
+#   ETHUSDT 2026-04-01~10-01：+12.08%（含分批止盈前口径）
+#   ETHUSDT 2024-01-01~2026-10-01 全历史：−53.55%，511 笔，胜率 62.6%，PF 0.80
+#   开启 TP1 分批止盈 + 保本移动后半年降到 +4.79%（回撤基本不变，−12.44% vs −12.35%），
+#   关掉（--tp1-r 0 --breakeven-r 0）为 +12.42% —— 分批止盈在这里是降风险也降收益的取舍。
+#   结论：阈值是在半年窗口上扫出来的，全历史负期望说明它没有穿过完整周期；
+#   "周 10%" 的目标不可达，paper 阶段的目的是观察一致性，不是盈利。
